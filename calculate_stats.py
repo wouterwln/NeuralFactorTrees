@@ -4,7 +4,7 @@ import torch
 from tqdm import tqdm
 
 if __name__ == "__main__":
-    batch_size = 5
+    batch_size = 1
     dataset = TracksterDataset("tracksters_preprocessed.root", "Tracksters;1", "Edges;1")
     data = DataLoader(dataset, num_workers=3, prefetch_factor=3, batch_size=batch_size,
                       collate_fn=TracksterDataset.collate_fn, persistent_workers=True)

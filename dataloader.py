@@ -88,7 +88,6 @@ class TracksterDataset(Dataset):
         g = dgl.graph((o, t), num_nodes=num_nodes)
         g.ndata["features"] = node_features
         g = dgl.add_reverse_edges(g)
-        g = dgl.add_edges(g, [i for i in range(g.number_of_nodes())], [g.number_of_nodes() for _ in range(g.number_of_nodes())])
         g = dgl.add_self_loop(g)
         labels = torch.Tensor(trackster["label"])
         return g, labels

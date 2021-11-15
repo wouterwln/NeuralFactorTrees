@@ -1,6 +1,6 @@
 from dataloader import TracksterDataset
 from torch.utils.data import DataLoader, Subset, random_split
-from modules import ARGraphPruningModule, ARGGSNN
+from modules import ARGraphPruningModule
 import torch
 import pytorch_lightning as pl
 import math
@@ -18,7 +18,7 @@ def train(filename, trackster_root_name, edge_root_name, batch_size, training_fr
     val_loader = DataLoader(val_data, batch_size=batch_size, num_workers=workers, collate_fn=TracksterDataset.collate_fn, prefetch_factor=prefetch_factor)
     test_loader = DataLoader(test_data, batch_size=batch_size, num_workers=workers, collate_fn=TracksterDataset.collate_fn, prefetch_factor=prefetch_factor)
     # model
-    model = ARGraphPruningModule(9, 16, 2)
+    model = ARGraphPruningModule(9, 64, 2, 8, 1)
 
     # training
     trainer = pl.Trainer(gpus=torch.cuda.device_count(), precision=32, accelerator="dp", auto_lr_find=True, max_epochs=epochs)
