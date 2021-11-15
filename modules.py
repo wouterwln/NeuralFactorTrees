@@ -24,16 +24,15 @@ class Initializer(Module):
         x = F.relu(self.lin3(x))
         return x
 
+
 class GRUCell(Module):
     def __init__(self, input_size, h_feats):
         super(GRUCell, self).__init__()
         self.input_size = input_size
         self.h_feats = h_feats
 
-
         self.x2h = Linear(input_size, 3 * h_feats)
         self.h2h = Linear(h_feats, 3 * h_feats)
-
 
     def forward(self, input, hx=None):
         x_t = self.x2h(input)
@@ -50,10 +49,48 @@ class GRUCell(Module):
 
         return hy
 
+
+class LSTMCell(Module):
+    def __init__(self, input_size, hidden_size):
+        super(LSTMCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        self.xh = Linear(input_size, hidden_size * 4)
+        self.hh = Linear(hidden_size, hidden_size * 4)
+
+    def forward(self, input, hx=None):
+        # Inputs:
+        #       input: of shape (batch_size, input_size)
+        #       hx: of shape (batch_size, hidden_size)
+        # Outputs:
+        #       hy: of shape (batch_size, hidden_size)
+        #       cy: of shape (batch_size, hidden_size)
+
+        hx, cx = hx
+
+        gates = self.xh(input) + self.hh(hx)
+
+        # Get gates (i_t, f_t, g_t, o_t)
+        input_gate, forget_gate, cell_gate, output_gate = gates.chunk(4, 1)
+
+        i_t = torch.sigmoid(input_gate)
+        f_t = torch.sigmoid(forget_gate)
+        g_t = torch.tanh(cell_gate)
+        o_t = torch.sigmoid(output_gate)
+
+        cy = cx * f_t + i_t * g_t
+
+        hy = o_t * torch.tanh(cy)
+
+        return (hy, cy)
+
+
 class GNNCell(Module):
     def __init__(self, h_feats, num_iterations, num_outputs):
         super(GNNCell, self).__init__()
-        self.convBlock = Sequential(*[SAGEConv(h_feats, h_feats, 'lstm', activation=ReLU()) for _ in range(num_iterations)])
+        self.convBlock = Sequential(
+            *[SAGEConv(h_feats, h_feats, 'lstm', activation=ReLU()) for _ in range(num_iterations)])
         self.lin = Linear(h_feats, num_outputs)
 
     def forward(self, g, h):
@@ -61,11 +98,13 @@ class GNNCell(Module):
         o = self.lin(h)
         return o, h
 
+
 class ARGraphPruningModule(pl.LightningModule):
     def __init__(self, in_feats, h_feats, num_outputs, num_gnn_steps, num_iterations):
         super(ARGraphPruningModule, self).__init__()
         self.in_read = Initializer(in_feats, h_feats)
         self.gru = GRUCell(num_outputs, h_feats)
+        self.mem = LSTMCell(h_feats, h_feats)
         self.gnn = GNNCell(h_feats, num_gnn_steps, num_outputs)
 
         self.num_iterations = num_iterations
@@ -73,13 +112,17 @@ class ARGraphPruningModule(pl.LightningModule):
         self.h_feats = h_feats
 
         self.learning_rate = 0.001
-        self.weight = torch.tensor([1., 50.]).cuda()
+        self.weight = torch.tensor([1., 70.]).cuda()
 
     def forward(self, g, in_feat):
         h = self.in_read(in_feat)
         x = torch.zeros(g.number_of_nodes(), 2).to(g.device)
+        c = torch.zeros_like(h)
+        mh = torch.zeros_like(h)
         for i in range(self.num_iterations):
             h = self.gru(x, h)
+            h, c = self.mem(h, (mh, c))
+            mh = h
             o, h = self.gnn(g, h)
             x = F.softmax(o, dim=1)
         return o
@@ -102,8 +145,10 @@ class ARGraphPruningModule(pl.LightningModule):
             pred = torch.argmax(logits, dim=1)
             self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False)
             if sum(labels) > 0:
-                self.log(f"{tag}_precision", precision_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False, on_epoch=True, on_step=False)
-                self.log(f"{tag}_recall", recall_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False, on_epoch=True, on_step=False)
+                self.log(f"{tag}_precision", precision_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False,
+                         on_epoch=True, on_step=False)
+                self.log(f"{tag}_recall", recall_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False,
+                         on_epoch=True, on_step=False)
 
         self.log(f"{tag}_loss", loss, on_epoch=True, prog_bar=False, on_step=False)
         return loss
