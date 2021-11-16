@@ -1,7 +1,7 @@
 import argparse
 
-def parse_voxelnet():
-    parser = argparse.ArgumentParser(description="Train the VoxelNet model on HGCAL data")
+def parse_trainer(parser):
+
     parser.add_argument("filename", help="The filename of the root file containing events")
     parser.add_argument("trackster_root_name", help="The root name of the tracksters in the root file")
     parser.add_argument("edge_root_name", help="The root name of the edges in the root file")
@@ -13,8 +13,7 @@ def parse_voxelnet():
     parser.add_argument("--workers", type=int, help="Number of worker threads to use for data fetching", default=8)
     parser.add_argument("--seed", type=int, help="Seed to use for random sampling", default=42)
     parser.add_argument("--output_file", type=str, help="File to write output model to", default="voxelnet.pt")
-    argv = parser.parse_args()
-    return argv
+    return parser
 
 def restricted_float(x):
     x = float(x)
