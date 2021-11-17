@@ -12,10 +12,23 @@ def train(filename, trackster_root_name, edge_root_name, batch_size, training_fr
                                                          sampling_fraction, training_fraction, seed, batch_size,
                                                          workers, prefetch_factor)
     model, logger = GraphPruner.parse_arguments(args)
-    trainer = pl.Trainer(gpus=torch.cuda.device_count(), precision=32, accelerator="dp", max_epochs=epochs, logger=logger)
+    trainer = pl.Trainer(gpus=1, precision=32, accelerator="dp", max_epochs=epochs, logger=logger)
     trainer.fit(model, train_loader, val_loader)
     return model
 
+def gridsearch(filename, trackster_root_name, edge_root_name, batch_size, training_fraction, epochs,
+          workers, prefetch_factor, sampling_fraction, seed, args):
+    train_loader, val_loader, test_loader = prepare_data(filename, trackster_root_name, edge_root_name,
+                                                         sampling_fraction, training_fraction, seed, batch_size,
+                                                         workers, prefetch_factor)
+    for aggregator in ['gru', 'lstm']:
+        for memory in ['gru', 'lstm', 'none']:
+            args.aggregator = aggregator
+            args.memory = memory
+            model, logger = GraphPruner.parse_arguments(args)
+            trainer = pl.Trainer(gpus=1, precision=32, accelerator="dp", max_epochs=epochs,
+                                 logger=logger)
+            trainer.fit(model, train_loader, val_loader)
 
 def prepare_data(filename, trackster_root_name, edge_root_name, sampling_fraction, training_fraction, seed, batch_size,
                  workers, prefetch_factor):

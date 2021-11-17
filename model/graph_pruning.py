@@ -13,7 +13,7 @@ class GraphPruner(pl.LightningModule):
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group("ARGNNModel")
-        parser.add_argument("--hidden_dim", type=int, default=128)
+        parser.add_argument("--hidden_dim", type=int, default=256)
         parser.add_argument("--num_gnn_steps", type=int, default=10)
         parser.add_argument("--num_iterations", type=int, default=10)
         parser.add_argument("--aggregator", type=str, default='lstm')
