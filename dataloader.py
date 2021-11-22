@@ -4,6 +4,8 @@ from torch.utils.data import Dataset
 import json
 import dgl
 import uproot
+import numpy as np
+from synthetic_graph_generation import *
 from torch.utils.data.dataset import T_co
 
 
@@ -82,7 +84,13 @@ class TracksterDataset(Dataset):
         for i, key in enumerate(
                 ["pos_x", "pos_y", "pos_z", "energy", "time", "eta", "phi", "isSeedCLUE3DHigh", "isSeedCLUE3DLow"]):
             node_features[:, i] = torch.Tensor(trackster[key])
-        node_features[:, :3] = node_features[:, :3] - node_features[0, :3]
+        if sum(trackster["isSeedCLUE3DLow"]) > 0:
+            seed = np.argsort(trackster["isSeedCLUE3DLow"])[-1]
+        elif sum(trackster["isSeedCLUE3DHigh"]) > 0:
+            seed = np.argsort(trackster["isSeedCLUE3DHigh"])[-1]
+        else:
+            seed = 0
+        node_features[:, :3] = node_features[:, :3] - node_features[seed, :3]
         node_features[:, 4] = F.relu(node_features[:,4])
         o, t = [ids.index(i) for i in edges.origin], [ids.index(i) for i in edges.target]
         g = dgl.graph((o, t), num_nodes=num_nodes)
@@ -96,3 +104,16 @@ class TracksterDataset(Dataset):
     def collate_fn(data):
         return data
 
+class SyntheticData(Dataset):
+    def __init__(self, num_graphs_per):
+        self.graphs = [generate_example_graph() for i in range(num_graphs_per)]
+
+    def __getitem__(self, item):
+        return self.graphs[item]
+
+    def __len__(self):
+        return len(self.graphs)
+
+    @staticmethod
+    def collate_fn(data):
+        return data

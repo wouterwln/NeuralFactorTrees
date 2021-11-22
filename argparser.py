@@ -12,7 +12,8 @@ def parse_trainer(parser):
     parser.add_argument("--epochs", type=int, help="Specify the amount of epochs", default=100)
     parser.add_argument("--workers", type=int, help="Number of worker threads to use for data fetching", default=8)
     parser.add_argument("--seed", type=int, help="Seed to use for random sampling", default=42)
-    parser.add_argument("--output_file", type=str, help="File to write output model to", default="voxelnet.pt")
+    parser.add_argument("--output_file", type=str, help="File to write output model to", default="argnn.pt")
+    parser.add_argument("--gpus", type=int, help="Number of GPU's to train on (default 1)", default=1)
     return parser
 
 def restricted_float(x):

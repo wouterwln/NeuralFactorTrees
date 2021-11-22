@@ -2,28 +2,38 @@ import torch
 
 from torch.nn import functional as F
 from torch.nn import Linear, ReLU, BatchNorm1d, Dropout, Module
-from torch.utils.data import DataLoader, Subset
-from sklearn.metrics import precision_score, recall_score
 from dgl.nn import SAGEConv, GatedGraphConv
 from dgl.nn.pytorch.utils import Sequential
-from dataloader import TracksterDataset
 
-import pytorch_lightning as pl
 
 
 class Initializer(Module):
     def __init__(self, in_feats, h_feats):
         super(Initializer, self).__init__()
         self.lin1 = Linear(in_feats, h_feats // 2)
+        self.batchnorm1 = BatchNorm1d(h_feats // 2)
         self.lin2 = Linear(h_feats // 2, h_feats)
+        self.batchnorm2 = BatchNorm1d(h_feats)
         self.lin3 = Linear(h_feats, h_feats)
 
     def forward(self, x):
         x = F.relu(self.lin1(x))
+        x = self.batchnorm1(x)
         x = F.relu(self.lin2(x))
+        x = self.batchnorm2(x)
         x = F.relu(self.lin3(x))
         return x
 
+
+class GNNInitializer(Module):
+    def __init__(self, in_feats, h_feats, num_iterations):
+        super(GNNInitializer, self).__init__()
+        self.conv1 = SAGEConv(in_feats, h_feats, 'lstm',activation=ReLU())
+        self.convBlock = Sequential(
+            *[SAGEConv(h_feats, h_feats, 'lstm', activation=ReLU()) for _ in range(num_iterations)])
+
+    def forward(self, g, in_feats):
+        return self.convBlock(g, self.conv1(g, in_feats))
 
 class GRUCell(Module):
     def __init__(self, input_size, h_feats):
