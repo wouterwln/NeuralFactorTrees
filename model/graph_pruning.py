@@ -61,14 +61,14 @@ class GraphPruner(pl.LightningModule):
         pass
 
     def log_results(self, loss, pred, labels, tag):
-        self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False)
+        self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False, sync_dist=True, batch_size=1)
         if sum(labels) > 0:
             self.log(f"{tag}_precision", precision_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False,
-                     on_epoch=True, on_step=False)
+                     on_epoch=True, on_step=False, sync_dist=True, batch_size=1)
             self.log(f"{tag}_recall", recall_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False,
-                     on_epoch=True, on_step=False)
-        self.log("hp_metric", loss)
-        self.log(f"{tag}_loss", loss, on_epoch=True, prog_bar=False, on_step=False)
+                     on_epoch=True, on_step=False, sync_dist=True, batch_size=1)
+        self.log("hp_metric", loss, sync_dist=True, batch_size=1)
+        self.log(f"{tag}_loss", loss, on_epoch=True, prog_bar=False, on_step=False, sync_dist=True, batch_size=1)
 
 
 class GNNPruner(GraphPruner):
@@ -96,11 +96,10 @@ class GNNPruner(GraphPruner):
         self.h_feats = h_feats
 
         self.learning_rate = lr
-        self.weight = torch.tensor([1., 20.]).cuda()
         self.autoregressive = autoregressive
 
+
     def _step_autoregressive(self, batch, tag):
-        weight = self.weight.to(batch[0][0].device)
         loss = 0
         for g, labels in batch:
             output = torch.zeros(g.number_of_nodes(), 2).to(g.device)
@@ -132,8 +131,9 @@ class GNNPruner(GraphPruner):
                 seq = torch.zeros_like(output)
                 seq[chosen_node, 0] = 1.
                 seq[chosen_node, 1] = labels[chosen_node]
-                loss += (F.cross_entropy(o[unseen], labels[unseen].long(), reduction='none',
-                                         weight=weight) * scores).mean()
+                weight = self._calculate_weights(labels)
+                loss += torch.sum(F.cross_entropy(o[unseen], labels[unseen].long(), reduction='none',
+                                         weight=weight) * scores)
                 output[chosen_node] = o[chosen_node]
             loss = loss / g.number_of_nodes()
             pred = torch.argmax(output, dim=1)
@@ -142,10 +142,10 @@ class GNNPruner(GraphPruner):
 
     def _step_eqfinding(self, batch, tag):
         loss = 0
-        self.weight = self.weight.to(batch[0][0].device)
         for g, labels in batch:
             logits = self._forward_eqfinding(g, g.ndata["features"])
-            loss += F.cross_entropy(logits, labels.long(), weight=self.weight)
+            weight = self._calculate_weights(labels)
+            loss += F.cross_entropy(logits, labels.long(), weight=weight)
             pred = torch.argmax(logits, dim=1)
             self.log_results(loss, pred, labels, tag)
         return loss
@@ -176,3 +176,11 @@ class GNNPruner(GraphPruner):
             o, h, _ = self.gnn(g, h)
             x = F.softmax(o, dim=1)
         return o
+
+    @staticmethod
+    def _calculate_weights(labels):
+        positives = max(1, torch.sum(labels == 1).detach())
+        negatives = max(1, torch.sum(labels == 0).detach())
+        frac = negatives / positives
+        weight = torch.tensor([1., frac], device=labels.device)
+        return weight

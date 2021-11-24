@@ -63,5 +63,3 @@ Since we use [Pytorch Lightning](https://www.pytorchlightning.ai/), the metrics 
 tensorboard dev upload --logdir tb_logs/GraphPruner --name "GraphPruning"
 ```
 to upload an experiment to TensorBooard. Here we also have hyperparameter logging under the hyperparameter tab to track the individual settings of the different experiments.
-## Known Issues
-When using multi-GPU training, the tensorboard logging of metrics is wrong (no idea why, it's a bug in DistributedDataParallel from PyTorch when combined with a TensorBoard logger). It's faster (scales linearly with the number of GPU's, obviously), but we don't get a nice overview of the performance of the model.
