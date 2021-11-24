@@ -100,13 +100,10 @@ class GNNCell(Module):
     def __init__(self, h_feats, num_iterations, num_outputs):
         super(GNNCell, self).__init__()
         self.convBlock = Sequential(
-            *[SAGEConv(h_feats, h_feats, 'lstm', activation=ReLU()) for _ in range(num_iterations)])
-        self.cls = [torch.nn.Sequential(Linear(h_feats, h_feats), Dropout(0.2), ReLU()) for _ in range(5)]
-        self.cls += [Linear(h_feats, num_outputs)]
-        self.cls = torch.nn.Sequential(*self.cls)
-        self.cnf = [torch.nn.Sequential(Linear(h_feats, h_feats), Dropout(0.2), ReLU()) for _ in range(5)]
-        self.cnf += [Linear(h_feats, 1)]
-        self.cnf = torch.nn.Sequential(*self.cnf)
+            *[SAGEConv(h_feats, h_feats, 'lstm', activation=ReLU(), feat_drop=0.2) for _ in range(num_iterations)])
+        self.cls = Linear(h_feats, num_outputs)
+        self.cnf = Linear(h_feats, 1)
+
 
     def forward(self, g, h):
         h = self.convBlock(g, h)

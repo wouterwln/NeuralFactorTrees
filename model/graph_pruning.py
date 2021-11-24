@@ -131,7 +131,7 @@ class GNNPruner(GraphPruner):
                 seq = torch.zeros_like(output)
                 seq[chosen_node, 0] = 1.
                 seq[chosen_node, 1] = labels[chosen_node]
-                weight = self._calculate_weights(labels)
+                weight = self._calculate_weights(labels[unseen])
                 loss += torch.sum(F.cross_entropy(o[unseen], labels[unseen].long(), reduction='none',
                                          weight=weight) * scores)
                 output[chosen_node] = o[chosen_node]
