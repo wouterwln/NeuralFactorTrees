@@ -126,6 +126,7 @@ class GNNPruner(GraphPruner):
                     mh = h
                 o, h, l = self.gnn(g, h)
                 scores = F.softmax(l[unseen].flatten(), dim=0)
+                hard = F.gumbel_softmax(l[unseen].flatten(), tau=1, hard=True)
                 chosen_node = torch.where(unseen)[0][torch.argmax(scores)]
                 state[chosen_node] = 1.
                 seq = torch.zeros_like(output)

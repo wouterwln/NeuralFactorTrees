@@ -111,3 +111,16 @@ class GNNCell(Module):
         l = self.cnf(h)
         return o, h, l
 
+
+class GGConvCell(Module):
+    def __init__(self, h_feats, num_iterations, num_outputs):
+        super(GGConvCell, self).__init__()
+        self.conv = GatedGraphConv(h_feats, h_feats, num_iterations, 1)
+        self.cls = Linear(h_feats, num_outputs)
+        self.cnf = Linear(h_feats, 1)
+
+    def forward(self, g, h):
+        h = self.conv(g, h)
+        o = self.cls(h)
+        l = self.cnf(h)
+        return o, h, l

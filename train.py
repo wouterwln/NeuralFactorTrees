@@ -71,7 +71,7 @@ def train_synthetic_data(batch_size, workers, args, epochs, training_fraction=0.
                             collate_fn=TracksterDataset.collate_fn)
     test_loader = DataLoader(test_data, batch_size=batch_size, collate_fn=TracksterDataset.collate_fn)
 
-    model, logger = GraphPruner.parse_arguments(args)
-    trainer = pl.Trainer(gpus=1, precision=32, accelerator="dp", max_epochs=epochs, logger=logger)
+    model=GNNPruner(9, 16, 2, 3, autoregressive=False, aggregator='gru', memory='lstm')
+    trainer = pl.Trainer(gpus=1, precision=32, accelerator="dp", max_epochs=epochs)
     trainer.fit(model, train_loader, val_loader)
     return model
