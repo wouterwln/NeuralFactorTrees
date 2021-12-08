@@ -106,7 +106,7 @@ class TracksterDataset(Dataset):
 
 class SyntheticData(Dataset):
     def __init__(self, num_graphs_per):
-        self.graphs = [generate_example_graph() for i in range(num_graphs_per)]
+        self.graphs = [generate_split() for i in range(num_graphs_per)]
 
     def __getitem__(self, item):
         return self.graphs[item]

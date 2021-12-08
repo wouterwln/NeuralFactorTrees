@@ -53,7 +53,7 @@ def get_trainer(epochs, gpus, tag):
 
 
 def train_synthetic_data(batch_size, workers, args, epochs, training_fraction=0.75):
-    dataset = SyntheticData(200)
+    dataset = SyntheticData(1000)
     splits = [math.ceil(i * len(dataset)) for i in
               [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
     while sum(splits) > len(dataset):
@@ -64,8 +64,8 @@ def train_synthetic_data(batch_size, workers, args, epochs, training_fraction=0.
     val_loader = DataLoader(val_data, batch_size=batch_size,
                             collate_fn=TracksterDataset.collate_fn)
     test_loader = DataLoader(test_data, batch_size=batch_size, collate_fn=TracksterDataset.collate_fn)
-
-    model, logger = GMNN.parse_arguments(args)
-    trainer = pl.Trainer(gpus=1, precision=32, accelerator="dp", max_epochs=epochs, logger=logger)
+    pl.seed_everything(42)
+    model = GMNN(16, 10, 0, 10, dropout=0.2, num_steps=2, teacher_forcing=0.5, include_features=False)
+    trainer = get_trainer(20, 1, "gmnn_synthetic")
     trainer.fit(model, train_loader, val_loader)
     return model

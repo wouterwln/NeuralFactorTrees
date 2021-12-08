@@ -1,7 +1,7 @@
 from argparser import parse_trainer
 import argparse
 from model.graph_pruning import GMNN
-from train import train
+from train import train, train_synthetic_data
 import torch
 import numpy as np
 

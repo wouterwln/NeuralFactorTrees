@@ -2,6 +2,7 @@ import dgl
 import torch
 import random
 
+
 def generate_clique(num_nodes, seem_pos, pos):
     o = [([i] * (num_nodes)) for i in range(num_nodes)]
     o = [item for sublist in o for item in sublist]
@@ -12,20 +13,22 @@ def generate_clique(num_nodes, seem_pos, pos):
     indices = torch.randint(g.number_of_nodes(), (seem_pos,))
     features[indices] = features[indices] * 2
     labels = torch.zeros(g.number_of_nodes())
-    labels[indices[:pos+1]] = 1
+    labels[indices[:pos + 1]] = 1
     g.ndata["features"] = features
     return g, labels
 
+
 def generate_split():
-    o = [0, 1, 1, 2, 3, 4]
-    t = [1, 2, 3, 4, 4, 5]
+    o = [0, 1, 2, 3, 4, 5]
+    t = [1, 2, 3, 4, 5, 0]
     g = dgl.graph((o, t))
     g.ndata["features"] = torch.randn((g.number_of_nodes(), 9))
     if random.random() > 0.5:
-        labels = torch.tensor([1, 0, 1, 0, 0, 1])
+        labels = torch.tensor([0, 1, 0, 1, 0, 1])
     else:
-        labels = torch.tensor([1, 0, 0, 1, 0, 1])
+        labels = torch.tensor([1, 0, 1, 0, 1, 0])
     return dgl.add_self_loop(dgl.add_reverse_edges(g)), labels
+
 
 def generate_example_graph():
     o = [0, 1, 1, 2]
