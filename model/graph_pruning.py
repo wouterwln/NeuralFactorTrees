@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import dgl.nn.pytorch
 import pytorch_lightning as pl
 from torch import nn
@@ -6,45 +8,121 @@ import torch.nn.functional as F
 from sklearn.metrics import precision_score, recall_score
 from dgl.nn.pytorch import SAGEConv, GraphConv, GATConv, Sequential
 import numpy as np
+import dgl.function as fn
+from model.modules import GATBackbone, GMMBackbone, GeneralBackbone
 
 
-class GCNMNN(nn.Module):
-    def __init__(self, num_h_feats, in_feats=9, dropout=0.5, num_classes=2):
-        super(GCNMNN, self).__init__()
-        self.conv1 = GraphConv(in_feats, num_h_feats)
-        self.conv2 = GraphConv(num_h_feats, num_classes)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+class TIGMN(pl.LightningModule):
+    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2, backbone='gat'):
+        super(TIGMN, self).__init__()
+        self.save_hyperparameters()
+        assert backbone in ['gat', 'ggsnn', 'tag', 'gmm']
+        if backbone == 'gat':
+            self.e = GATBackbone(num_h_feats, in_feats, dropout, num_classes=num_h_feats, num_steps=num_steps)
+        elif backbone == 'gmm':
+            self.e = GMMBackbone(num_h_feats, in_feats, num_steps=num_steps)
+        else:
+            self.e = GeneralBackbone(num_h_feats, in_feats, num_steps=num_steps, convoperator=backbone)
+        self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
+        self.node_generator = nn.Linear(num_h_feats, num_classes)
 
-    def forward(self, g, feats):
-        h = self.dropout2(self.conv1(g, self.dropout1(feats)))
-        o = self.conv2(g, h)
-        return o
+    def configure_optimizers(self):
+        lr = self.hparams.lr
+        opt = torch.optim.RMSprop(self.parameters(), lr=lr)
+        return opt
 
+    def forward(self, g):
+        feats = g.ndata["x"]
+        prop_graph = dgl.add_self_loop(dgl.add_reverse_edges(g))
+        h = self.e(prop_graph, feats)
+        g.ndata["feat"] = h
+        g = self.generate_edge_factors(g)
+        g.ndata["out"] = self.node_generator(h)
+        return g
 
-class GatMNN(nn.Module):
-    def __init__(self, num_h_feats, in_feats=9, in_dropout=0.5, dropout=0., num_classes=2, num_heads=3, num_steps=2):
-        super(GatMNN, self).__init__()
-        assert num_steps >= 2
-        self.conv1 = GATConv(in_feats, num_h_feats, num_heads, feat_drop=dropout)
-        self.convBlock = Sequential(
-            *[GATConv(num_h_feats, num_h_feats, num_heads, feat_drop=dropout) for _ in range(num_steps - 2)])
-        self.conv2 = GATConv(num_h_feats, num_classes, num_heads, feat_drop=dropout)
-        self.dropout1 = nn.Dropout(in_dropout)
+    def step(self, batch, tag):
+        labels = batch.ndata["y"]
+        pgm = self(batch)
+        likelihood = self.sum_likelihood(pgm, labels) - self.partition_function(pgm)
+        likelihood = likelihood/len(labels)
+        loss = -likelihood
+        sample = self.sample(pgm)
+        self.log(f"{tag}_log_likelihood", likelihood, sync_dist=True)
+        self.log(f"{tag}_accuracy", (labels == sample).float().mean(), prog_bar=False, on_epoch=True, on_step=True,
+                 sync_dist=True, batch_size=1)
+        return loss
 
-    def forward(self, g, feats):
-        h = self.conv1(g, self.dropout1(feats))
-        h = torch.sum(h, dim=1)
-        for layer in self.convBlock:
-            h = layer(g, h)
-            h = torch.sum(h, dim=1)
-        o = self.conv2(g, h)
-        o = torch.sum(o, dim=1)
-        return o
+    def training_step(self, batch, batch_idx):
+        return self.step(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        self.step(batch, "val")
+
+    def generate_edge_factors(self, g):
+        g.apply_edges(self.concat_message_function)
+        g.edata['out'] = self.edge_generator(g.edata['cat_feat'])
+        return g
+
+    @staticmethod
+    def partition_function(pgm):
+        order = dgl.topological_nodes_generator(pgm)
+        for nodes in order:
+            nodes = nodes.to(pgm.device)
+            pgm.pull(nodes, TIGMN.send_message, fn.sum('factor', 'fct'))
+            pgm.apply_nodes(lambda x: {'out': x.data['out'] + x.data['fct']}, nodes)
+        roots = dgl.topological_nodes_generator(pgm, reverse=True)[0].to(pgm.device)
+        return torch.sum(torch.logsumexp(pgm.ndata["out"][roots], dim=-1))
+
+    @staticmethod
+    def sum_likelihood(pgm, labels):
+        pgm.apply_nodes(lambda nodes: {"c": nodes.data["out"][F.one_hot(labels, num_classes = 2).bool()]})
+        pgm.apply_edges(TIGMN.edge_output)
+        return torch.sum(pgm.ndata["c"]) + torch.sum(pgm.edata["c"])
+
+    @staticmethod
+    def sample(pgm):
+        o, t = pgm.edges()
+        order = dgl.topological_nodes_generator(pgm)
+        pgm = dgl.add_edges(pgm, t, o, data={"out": torch.transpose(pgm.edata["out"].reshape((-1, 2, 2)), 1,2).reshape((-1, 4))})
+        pgm.pull(pgm.nodes(), TIGMN.receive_sample_init_msg, fn.sum('factor', 'fct'))
+        pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
+        pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
+        for i in range(3):
+            for nodes in order:
+                nodes = nodes.to(pgm.device)
+                pgm.pull(nodes, TIGMN.receive_sample_loopy_msg, fn.sum('factor', 'fct'))
+                pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
+                pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
+        return torch.argmax(pgm.ndata["label"], dim=-1)
+
+    @staticmethod
+    def edge_output(edges):
+        labels = F.one_hot(edges.src["y"] + 2 * edges.dst["y"], num_classes = 4).bool()
+        return {"c": edges.data["out"][labels]}
+
+    @staticmethod
+    def send_message(edges):
+        messages = edges.data["out"].reshape((-1, 2, 2)) + edges.src["out"].unsqueeze(1)
+        messages = torch.logsumexp(messages, dim=-1)
+        return {"factor": messages}
+
+    @staticmethod
+    def concat_message_function(edges):
+        return {'cat_feat': torch.cat([edges.src['feat'], edges.dst['feat']], dim=1)}
+
+    @staticmethod
+    def receive_sample_init_msg(edges):
+        messages = edges.data["out"].reshape((-1, 2, 2))
+        messages = torch.logsumexp(messages, dim=-1)
+        return {"factor": messages}
+
+    @staticmethod
+    def receive_sample_loopy_msg(edges):
+        return {"factor": torch.transpose(edges.data["out"].reshape((-1, 2, 2)), 1, 2)[edges.src["label"].bool()]}
+
 
 
 class GMNN(pl.LightningModule):
-    # TODO lots of calls to softmax after pushing stuff through q, makes it really ugly, try to fix this somewhere
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -53,31 +131,24 @@ class GMNN(pl.LightningModule):
                             help="number of hidden features to use")
         parser.add_argument("--num_gnn_steps", type=int, default=3,
                             help="number of message passing steps to use for p and q")
-        parser.add_argument("--pretrain_epochs", type=int, default=25, help="Number of epochs to do for pretraining q")
-        parser.add_argument("--iterations", type=int, default=1,
-                            help="Number of iterations to train the EM procedure")
-        parser.add_argument("--epochs_q", type=int, default=50, help="Number of epochs to train q in every iteration")
-        parser.add_argument("--epochs_p", type=int, default=50, help="Number of epochs to train p in every iteration")
-        parser.add_argument("--teacher_forcing", type=float, default=0.8, help="Amount of teacher forcing to use")
+        parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train q in every iteration")
         parser.add_argument("--learning_rate", type=float, default=1e-3, help="learning rate to train with")
         parser.add_argument("--in_dropout", type=float, default=0.5, help="Dropout factor on the input")
         parser.add_argument("--dropout", type=float, default=0., help="Dropout after every layer")
-        parser.add_argument("--stratified_tf", action='store_true')
         parser.add_argument("--include_features", action='store_true')
         return parent_parser
 
-    def __init__(self, num_h_feats, pretrain_epochs, epochs_q, epochs_p, in_feats=9, dropout=0.5, num_classes=2,
-                 lr=0.001, teacher_forcing=0.5, num_steps=2, stratified_tf=False, include_features=True):
+    def __init__(self, num_h_feats, in_feats=3, dropout=0.5, num_classes=2, lr=0.001, num_steps=2, include_features=True, epochs=100):
         super(GMNN, self).__init__()
         self.save_hyperparameters()
-        self.q = GatMNN(num_h_feats, in_feats, dropout=dropout, num_classes=num_classes, num_steps=num_steps)
-        self.p = GatMNN(num_h_feats, num_classes + (include_features * in_feats), dropout=dropout,
-                        num_classes=num_classes, num_steps=num_steps)
-        self.automatic_optimization = False
+        self.q = GATBackbone(num_h_feats, in_feats, dropout=dropout, num_classes=num_classes, num_steps=num_steps)
+        self.p = GATBackbone(num_h_feats, num_classes + (include_features * in_feats), dropout=dropout,
+                             num_classes=num_classes, num_steps=num_steps)
         if include_features:
             self.aggregation = lambda x, y: torch.cat([x, y], dim=1)
         else:
             self.aggregation = lambda x, y: x
+        self.automatic_optimization = False
 
     def configure_optimizers(self):
         lr = self.hparams.lr
@@ -87,115 +158,78 @@ class GMNN(pl.LightningModule):
         return opt_q, opt_p
 
     def forward(self, g, feats):
-        out_q = F.softmax(self.q(g, feats), dim=1)
-        self.aggregation(out_q, feats)
-        out_p = self.p(g, out_q)
+        out_q = self.q(g, feats)
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        in_p = self.aggregation(in_p, feats)
+        out_p = self.p(g, in_p)
         return out_p
 
-    def pretrain_step(self, batch):
-        for g, labels in batch:
-            opt, _ = self.optimizers()
-            features = g.ndata["features"]
-            out_q = self.q(g, features)
-            weights = self._calculate_weights(labels)
-            loss = F.cross_entropy(out_q, labels.long(), weight=weights)
-            pred = torch.argmax(out_q, dim=1)
-            self.log_results(loss, pred, labels, "q_train")
+    def step(self, g, tag):
+        features = g.ndata["x"]
+        labels = g.ndata["y"]
+        out_q = self.q(g, features)
+        #weights = self._calculate_weights(labels)
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        q_loss = F.cross_entropy(out_q, labels)
+        pred = torch.argmax(F.softmax(out_q, dim=-1), dim=-1).detach()
+        self.log_results(deepcopy(q_loss.detach()), pred, deepcopy(labels), f"q_{tag}")
+        in_p = self.aggregation(in_p, features).detach()
+        out_p = self.p(g, in_p)
+        p_loss = F.cross_entropy(out_p, labels)
+        pred = torch.argmax(F.softmax(out_p, dim=-1), dim=-1).detach()
+        self.log_results(deepcopy(p_loss.detach()), pred, deepcopy(labels), f"p_{tag}")
+        loss = q_loss + p_loss
+        return loss
+
+    def q_step(self, g, tag):
+        opt, _ = self.optimizers()
+        features = g.ndata["x"]
+        labels = g.ndata["y"]
+        out_q = self.q(g, features)
+        # weights = self._calculate_weights(labels)
+        loss = F.cross_entropy(out_q, labels)
+        if tag == "train":
             opt.zero_grad()
             self.manual_backward(loss)
             opt.step()
+        pred = torch.argmax(F.softmax(out_q, dim=-1), dim=-1).detach()
+        self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"q_{tag}")
 
-    def iterative_train_step(self, batch):
-        for g, labels in batch:
-            training_q = ((self.current_epoch - self.hparams.pretrain_epochs) % (
-                        self.hparams.epochs_q + self.hparams.epochs_p)) >= self.hparams.epochs_p
-            q_opt, p_opt = self.optimizers()
-            tf = self.hparams.teacher_forcing
-            features = g.ndata["features"]
-            weights = self._calculate_weights(labels)
-            mask = self.get_teacher_forcing_mask(labels, tf, self.hparams.stratified_tf)
-            # Train Q
-            if training_q:
-                out = self.q(g, features)
-                out_q = F.softmax(out, dim=1)
-                out_q = self.aggregation(out_q, features)
-                out_p = self.p(g, out_q)
-                target = F.one_hot(labels.long(), num_classes=self.hparams.num_classes).float()
-                target[mask] = F.softmax(out_p[mask], dim=1)
-                tag = "q_train"
-                #loss = -torch.mean(torch.sum(F.log_softmax(out, dim=-1) * target, dim=-1))
-                loss = F.cross_entropy(out, target, weight=weights)
-                q_opt.zero_grad()
-                self.manual_backward(loss)
-                q_opt.step()
-            # Train P
-            else:
-                out_q = F.softmax(self.q(g, features), dim=1).detach()
-                target = F.one_hot(labels.long(), num_classes=self.hparams.num_classes).float()
-                out_q[mask] = target[mask]
-                out_q = self.aggregation(out_q, features)
-                out = self.p(g, out_q)
-                tag = "p_train"
-                loss = F.cross_entropy(out, labels.long(), weight=weights)
-                p_opt.zero_grad()
-                self.manual_backward(loss)
-                p_opt.step()
+    def p_step(self, g, tag):
+        _, opt = self.optimizers()
+        features = g.ndata["x"]
+        labels = g.ndata["y"]
+        out_q = self.q(g, features)
+        # weights = self._calculate_weights(labels)
 
-            pred = torch.argmax(out, dim=1)
-            self.log_results(loss, pred, labels, tag)
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        in_p = self.aggregation(in_p, features).detach()
+        out_p = self.p(g, in_p)
+
+        loss = F.cross_entropy(out_p, labels)
+        if tag == "train":
+            opt.zero_grad()
+            self.manual_backward(loss)
+            opt.step()
+        pred = torch.argmax(F.softmax(out_p, dim=-1), dim=-1).detach()
+        self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"p_{tag}")
 
     def training_step(self, batch, batch_idx):
-        if self.current_epoch < self.hparams.pretrain_epochs:
-            self.pretrain_step(batch)
+        batch = dgl.add_self_loop(dgl.add_reverse_edges(batch))
+        if self.current_epoch < self.hparams.epochs // 2:
+            self.q_step(batch, "train")
         else:
-            self.iterative_train_step(batch)
+            self.p_step(batch, "train")
 
     def validation_step(self, batch, batch_idx):
-        for g, labels in batch:
-            features = g.ndata["features"]
-            weights = self._calculate_weights(labels)
-            out_q = self.q(g, features)
-            pred = torch.argmax(out_q, dim=1)
-            q_loss = F.cross_entropy(out_q, labels.long(), weight=weights)
-            out_q = F.softmax(out_q, dim=1)
-            out_q = self.aggregation(out_q, features)
-            out_p = self.p(g, out_q)
-            p_loss = F.cross_entropy(out_p, labels.long(), weight=weights)
-            if not self.current_epoch < self.hparams.pretrain_epochs:
-                pred = torch.argmax(out_p, dim=1)
-                self.log_results(p_loss, pred, labels, "p_val")
-            else:
-                self.log_results(q_loss, pred, labels, "q_val")
+        batch = dgl.add_self_loop(dgl.add_reverse_edges(batch))
+        if self.current_epoch < self.hparams.epochs // 2:
+            self.q_step(batch, "val")
+        else:
+            self.p_step(batch, "val")
 
     def log_results(self, loss, pred, labels, tag):
         self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
                  sync_dist=True, batch_size=1)
-        if sum(labels) > 0:
-            self.log(f"{tag}_recall", recall_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False,
-                     on_epoch=True, on_step=False, sync_dist=True, batch_size=1)
-        if sum(pred) > 0:
-            self.log(f"{tag}_precision", precision_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False,
-                     on_epoch=True, on_step=False, sync_dist=True, batch_size=1)
         self.log("hp_metric", loss, sync_dist=True, batch_size=1)
-        self.log(f"{tag}_loss", loss, on_epoch=True, prog_bar=True, on_step=False, sync_dist=True, batch_size=1)
-
-    @staticmethod
-    def _calculate_weights(labels):
-        positives = max(1, torch.sum(labels == 1).detach())
-        negatives = max(1, torch.sum(labels == 0).detach())
-        frac = negatives / positives
-        weight = torch.tensor([1., frac], device=labels.device)
-        return weight
-
-    @staticmethod
-    def get_teacher_forcing_mask(labels, tf, stratified=True):
-        if not stratified:
-            mask = np.random.choice([0, 1], size=len(labels), p=[1 - tf, tf])
-            mask = torch.from_numpy(mask) == 1
-        else:
-            mask = torch.zeros(len(labels), dtype=torch.int32)
-            for i in range(len(set(labels))):
-                mask[labels == i] = torch.from_numpy(
-                    np.random.choice([0, 1], size=len(labels[labels == i]), p=[1 - tf, tf]))
-            mask = mask == 1
-        return mask
+        self.log(f"{tag}_loss", loss, prog_bar=True, sync_dist=True, batch_size=1)

@@ -1,10 +1,12 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import json
 import dgl
 import uproot
 import numpy as np
+from tqdm import tqdm
+
 from synthetic_graph_generation import *
 from torch.utils.data.dataset import T_co
 
@@ -93,20 +95,37 @@ class TracksterDataset(Dataset):
         node_features[:, :3] = node_features[:, :3] - node_features[seed, :3]
         node_features[:, 4] = F.relu(node_features[:,4])
         o, t = [ids.index(i) for i in edges.origin], [ids.index(i) for i in edges.target]
-        g = dgl.graph((o, t), num_nodes=num_nodes)
-        g.ndata["features"] = node_features
-        g = dgl.add_reverse_edges(g)
-        g = dgl.add_self_loop(g)
-        labels = torch.Tensor(trackster["label"])
-        return g, labels
+        g = dgl.graph((t, o), num_nodes=num_nodes)
+        g.ndata["x"] = node_features
+        #g = dgl.add_reverse_edges(g)
+        #g = dgl.add_self_loop(g)
+        g.ndata["y"] = torch.Tensor(trackster["label"]).long()
+        return g
 
     @staticmethod
     def collate_fn(data):
-        return data
+        return dgl.batch(data)
+
+class InMemoryDataset(Dataset):
+    def __init__(self, filename, trackster_root_name, edge_root_name, step_size=100):
+        set = TracksterDataset(filename, trackster_root_name, edge_root_name, step_size)
+        self.data = []
+        loader = DataLoader(set, batch_size=16, num_workers=20, prefetch_factor=3, persistent_workers=False,collate_fn=SyntheticData.collate_fn, shuffle=False)
+        for batch in tqdm(loader):
+            self.data.extend(batch)
+            if len(self.data) > 5000:
+                break
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, item):
+        return self.data[item]
 
 class SyntheticData(Dataset):
     def __init__(self, num_graphs_per):
-        self.graphs = [generate_split() for i in range(num_graphs_per)]
+        self.graphs = [generate_example_graph() for i in range(num_graphs_per)]
+        #self.graphs.extend([generate_example_graph() for i in range(num_graphs_per)])
 
     def __getitem__(self, item):
         return self.graphs[item]

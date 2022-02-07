@@ -17,31 +17,38 @@ def generate_clique(num_nodes, seem_pos, pos):
     g.ndata["features"] = features
     return g, labels
 
-
 def generate_split():
-    o = [0, 1, 2, 3, 4, 5]
-    t = [1, 2, 3, 4, 5, 0]
+    o = [0, 1, 2, 3, 4, 5, 6]
+    t = [1, 2, 3, 4, 5, 6, 0]
     g = dgl.graph((o, t))
-    g.ndata["features"] = torch.randn((g.number_of_nodes(), 9))
+    g.ndata["x"] = torch.randn((g.number_of_nodes(),9))
     if random.random() > 0.5:
-        labels = torch.tensor([0, 1, 0, 1, 0, 1])
+        labels = torch.tensor([0, 1, 0, 1, 0, 1, 1])
     else:
-        labels = torch.tensor([1, 0, 1, 0, 1, 0])
-    return dgl.add_self_loop(dgl.add_reverse_edges(g)), labels
+        labels = torch.tensor([1, 0, 1, 0, 1, 0, 1])
+    g.ndata["y"] = labels
+    return dgl.add_self_loop(dgl.add_reverse_edges(g))
 
 
 def generate_example_graph():
-    o = [0, 1, 1, 2]
-    t = [1, 2, 3, 3]
+    o = [0, 1, 1, 2, 3]
+    t = [1, 2, 3, 3, 4]
     g = dgl.graph((o, t))
-    features = torch.randn((g.number_of_nodes(), 9))
-    features[[0, 3]] = features[[0, 3]] * 2
-    g.ndata["features"] = features
+    g.ndata["x"] = torch.ones((g.number_of_nodes(),3))
+    g.ndata["x"][[0, 3]] = g.ndata["x"][[0, 3]] * 2
+
     labels = torch.zeros(g.number_of_nodes())
-    if random.random() > 0.2:
+    r = random.random()
+    if r < 0.05:
+        pass
+    elif r < 0.45:
+        labels[0] = 1
+    elif r < 0.85:
         labels[3] = 1
-        if random.random() > 0.8:
-            labels[0] = 1
     else:
         labels[0] = 1
-    return dgl.add_self_loop(dgl.add_reverse_edges(g)), labels
+        labels[3] = 1
+    labels[4] = 1
+    g.ndata["y"]  = labels.long()
+
+    return dgl.add_self_loop(dgl.add_reverse_edges(g))

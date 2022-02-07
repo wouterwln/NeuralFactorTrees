@@ -1,111 +1,63 @@
 import torch
+import dgl
 
 from torch.nn import functional as F
-from torch.nn import Linear, ReLU, BatchNorm1d, Dropout, Module
-from dgl.nn.pytorch import SAGEConv, GatedGraphConv
+from torch import nn
+from dgl.nn.pytorch import GMMConv, GatedGraphConv, GATConv, TAGConv
 from dgl.nn.pytorch.utils import Sequential
 
-
-class Initializer(Module):
-    def __init__(self, in_feats, h_feats):
-        super(Initializer, self).__init__()
-        self.lin1 = Linear(in_feats, h_feats // 2)
-        self.batchnorm1 = BatchNorm1d(h_feats // 2)
-        self.lin2 = Linear(h_feats // 2, h_feats)
-        self.batchnorm2 = BatchNorm1d(h_feats)
-        self.lin3 = Linear(h_feats, h_feats)
-
-    def forward(self, x):
-        x = F.relu(self.lin1(x))
-        x = self.batchnorm1(x)
-        x = F.relu(self.lin2(x))
-        x = self.batchnorm2(x)
-        x = F.relu(self.lin3(x))
-        return x
-
-
-class GNNInitializer(Module):
-    def __init__(self, in_feats, h_feats, num_iterations):
-        super(GNNInitializer, self).__init__()
-        self.conv1 = SAGEConv(in_feats, h_feats, 'lstm', activation=ReLU())
+class GATBackbone(nn.Module):
+    def __init__(self, num_h_feats, in_feats=9, in_dropout=0., dropout=0., num_classes=2, num_heads=8, num_steps=2):
+        super(GATBackbone, self).__init__()
+        assert num_steps >= 2
+        self.conv1 = GATConv(in_feats, num_h_feats, num_heads, feat_drop=dropout)
         self.convBlock = Sequential(
-            *[SAGEConv(h_feats, h_feats, 'lstm', activation=ReLU()) for _ in range(num_iterations)])
+            *[GATConv(num_h_feats, num_h_feats, num_heads, feat_drop=dropout) for _ in range(num_steps - 2)])
+        self.conv2 = GATConv(num_h_feats, num_classes, num_heads)
+        self.dropout1 = nn.Dropout(in_dropout)
+        self.batchnorm = nn.BatchNorm1d(num_h_feats)
 
-    def forward(self, g, in_feats):
-        return self.convBlock(g, self.conv1(g, in_feats))
+    def forward(self, g, feats):
+        h = self.conv1(g, self.dropout1(feats))
+        h = torch.sum(h, dim=1)
+        h = self.batchnorm(h)
+        for layer in self.convBlock:
+            h = layer(g, h)
+            h = torch.sum(h, dim=1)
+            h = self.batchnorm(h)
+        o = self.conv2(g, h)
+        o = torch.sum(o, dim=1)
+        return o
 
+class GeneralBackbone(nn.Module):
+    def __init__(self, num_h_feats, in_feats=9, in_dropout=0., dropout=0., num_steps=2, convoperator='tag'):
+        super(GeneralBackbone, self).__init__()
+        if convoperator == 'tag':
+            self.convBlock = TAGConv(in_feats, num_h_feats, num_steps)
+        elif convoperator == "ggsnn":
+            self.convBlock = GatedGraphConv(in_feats, num_h_feats, num_steps, 1)
 
-class GRUCell(Module):
-    def __init__(self, input_size, h_feats):
-        super(GRUCell, self).__init__()
-        self.input_size = input_size
-        self.h_feats = h_feats
+    def forward(self, g, feats):
+        h = self.convBlock(g, feats)
+        return h
 
-        self.x2h = Linear(input_size, 3 * h_feats)
-        self.h2h = Linear(h_feats, 3 * h_feats)
+class GMMBackbone(nn.Module):
+    def __init__(self, num_h_feats, in_feats=9, in_dropout=0., dropout=0., num_steps=2):
+        super(GMMBackbone, self).__init__()
+        in_feats = in_feats - 3
+        self.convBlock = [GMMConv(in_feats, num_h_feats, 3, 2, 'mean')]
+        self.convBlock += [GMMConv(num_h_feats, num_h_feats, 3, 2, 'mean') for i in range(num_steps - 1)]
+        self.convBlock = Sequential(*self.convBlock)
+        pass
 
-    def forward(self, input, hx=None):
-        x_t = self.x2h(input)
-        h_t = self.h2h(hx)
+    def forward(self, g, feats):
+        g.apply_edges(self.edge_func)
+        feats = feats[:, 3:]
+        for layer in self.convBlock:
+            feats = layer(g, feats, g.edata["coords"])
+        return feats
 
-        x_reset, x_upd, x_new = x_t.chunk(3, 1)
-        h_reset, h_upd, h_new = h_t.chunk(3, 1)
-
-        reset_gate = torch.sigmoid(x_reset + h_reset)
-        update_gate = torch.sigmoid(x_upd + h_upd)
-        new_gate = torch.tanh(x_new + (reset_gate * h_new))
-
-        hy = update_gate * hx + (1 - update_gate) * new_gate
-
-        return hy
-
-
-class LSTMCell(Module):
-    def __init__(self, input_size, hidden_size):
-        super(LSTMCell, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-
-        self.xh = Linear(input_size, hidden_size * 4)
-        self.hh = Linear(hidden_size, hidden_size * 4)
-
-    def forward(self, input, hx=None):
-        # Inputs:
-        #       input: of shape (batch_size, input_size)
-        #       hx: of shape (batch_size, hidden_size)
-        # Outputs:
-        #       hy: of shape (batch_size, hidden_size)
-        #       cy: of shape (batch_size, hidden_size)
-
-        hx, cx = hx
-
-        gates = self.xh(input) + self.hh(hx)
-
-        # Get gates (i_t, f_t, g_t, o_t)
-        input_gate, forget_gate, cell_gate, output_gate = gates.chunk(4, 1)
-
-        i_t = torch.sigmoid(input_gate)
-        f_t = torch.sigmoid(forget_gate)
-        g_t = torch.tanh(cell_gate)
-        o_t = torch.sigmoid(output_gate)
-
-        cy = cx * f_t + i_t * g_t
-
-        hy = o_t * torch.tanh(cy)
-
-        return (hy, cy)
-
-
-class GNNCell(Module):
-    def __init__(self, h_feats, num_iterations, num_outputs):
-        super(GNNCell, self).__init__()
-        self.convBlock = Sequential(
-            *[SAGEConv(h_feats, h_feats, 'lstm', activation=ReLU(), feat_drop=0.2) for _ in range(num_iterations)])
-        self.cls = Linear(h_feats, num_outputs)
-        self.cnf = Linear(h_feats, 1)
-
-    def forward(self, g, h):
-        h = self.convBlock(g, h)
-        o = self.cls(h)
-        l = self.cnf(h)
-        return o, h, l
+    @staticmethod
+    def edge_func(edges):
+        coords = edges.dst["x"][:, :3] - edges.src["x"][:, :3]
+        return {"coords" : coords}
