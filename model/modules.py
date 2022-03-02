@@ -18,6 +18,7 @@ class GATBackbone(nn.Module):
         self.batchnorm = nn.BatchNorm1d(num_h_feats)
 
     def forward(self, g, feats):
+        g = dgl.add_self_loop(g)
         h = self.conv1(g, self.dropout1(feats))
         h = torch.sum(h, dim=1)
         h = self.batchnorm(h)
@@ -51,6 +52,7 @@ class GMMBackbone(nn.Module):
         pass
 
     def forward(self, g, feats):
+        g = dgl.add_self_loop(g)
         g.apply_edges(self.edge_func)
         feats = feats[:, 3:]
         for layer in self.convBlock:

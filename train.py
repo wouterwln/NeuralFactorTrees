@@ -9,86 +9,89 @@ import pytorch_lightning as pl
 import math
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.plugins import DDPPlugin
+from pytorch_lightning.callbacks.stochastic_weight_avg import StochasticWeightAveraging
 
-def gridsearch(batch_size, training_fraction,epochs, workers, prefetch_factor, sampling_fraction, seed,
-          learning_rate, gpus, dropout):
+
+def gridsearch(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed,
+               learning_rate, gpus, dropout):
     pl.seed_everything(seed)
-    train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
-                                                         workers, prefetch_factor)
-    for h_dim in [64, 128, 256]:
-        for num_gnn_steps in [2, 4, 6, 10]:
-            #model = GMNN(num_h_feats=h_dim, in_feats=9, epochs=100, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate)
-            #trainer = get_trainer(epochs, gpus, "gmnn")
-            #trainer.fit(model, train_loader, val_loader)
-            for backbone in ['gmm', 'gat', 'tag', 'ggsnn', 'gmm']:
+    train_loader, val_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
+                                            workers, prefetch_factor, InMemoryDataset)
+    for h_dim in [32, 64, 128, 256]:
+        for num_gnn_steps in [2, 4, 6]:
+            # model = GMNN(num_h_feats=h_dim, in_feats=9, epochs=100, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate)
+            # trainer = get_trainer(epochs, gpus, "gmnn")
+            # trainer.fit(model, train_loader, val_loader)
+            for backbone in ['gmm', 'gat', 'tag', 'ggsnn']:
                 model = TIGMN(num_h_feats=h_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate,
-                          backbone=backbone)
+                              backbone=backbone)
                 trainer = get_trainer(epochs, gpus, "mn")
                 trainer.fit(model, train_loader, val_loader)
 
 
-def train( batch_size, training_fraction,epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim, num_gnn_steps,
-          learning_rate, gpus, dropout, teacher_forcing, stratified_tf, include_feats):
-    train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
+def train(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
+          num_gnn_steps,
+          learning_rate, gpus, dropout):
+    train_loader, val_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                                             workers, prefetch_factor)
     pl.seed_everything(seed)
-    #model = TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate)
-    model = GMNN(num_h_feats=hidden_dim, in_feats=9, epochs=100, num_steps=num_gnn_steps, dropout=dropout)
+    model = GMNN(num_h_feats=hidden_dim, in_feats=9, epochs=epochs, num_steps=num_gnn_steps, dropout=dropout)
     trainer = get_trainer(epochs, gpus, "gmnn")
     trainer.fit(model, train_loader, val_loader)
     return model
 
-def train_tigmn( batch_size, training_fraction,epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim, num_gnn_steps,
-          learning_rate, gpus, dropout, teacher_forcing, stratified_tf, include_feats):
-    train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
-                                            workers, prefetch_factor)
+
+def train_tigmn(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
+                num_gnn_steps,
+                learning_rate, gpus, dropout, backbone):
     pl.seed_everything(seed)
-    model = TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate, backbone='gmm')
-    #model = GMNN(num_h_feats=hidden_dim, in_feats=9, epochs=100, num_steps=num_gnn_steps, dropout=dropout)
-    trainer = get_trainer(epochs, gpus, "gmnn")
+    train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
+                                                         workers, prefetch_factor)
+    model = TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate, backbone=backbone)
+    trainer = get_trainer(epochs, gpus, "tigmn")
+    trainer.tune(model, train_loader, val_loader)
     trainer.fit(model, train_loader, val_loader)
+    trainer.test(model, test_loader)
     return model
+
+
+def test_tigmn(training_fraction, workers, prefetch_factor, sampling_fraction, seed, hidden_dim, num_gnn_steps, gpus=1):
+    pl.seed_everything(seed)
+    test_loader = prepare_data(sampling_fraction, training_fraction, seed, 128, workers, prefetch_factor, test=True)
+    model = TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=.1, lr=.001, backbone='ggsnn')
+    trainer = get_trainer(1, gpus, "tigmn")
+    trainer.test(model, test_loader)
 
 
 def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
-                 workers, prefetch_factor):
-    dataset = TracksterDataset("tracksters_preprocessed.root", "Tracksters;1", "Edges;1")
+                 workers, prefetch_factor, memset=TracksterDataset, test=False):
+    dataset = memset("tracksters_preprocessed.root", "Tracksters;1", "Edges;1")
     dataset = Subset(dataset, [i for i in range(math.floor(sampling_fraction * len(dataset)))])
     splits = [math.ceil(i * len(dataset)) for i in
               [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
     while sum(splits) > len(dataset):
         splits[-1] -= 1
     train_data, val_data, test_data = random_split(dataset, splits, generator=torch.Generator().manual_seed(seed))
-    train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor, persistent_workers=True,collate_fn=TracksterDataset.collate_fn)
-    val_loader = DataLoader(val_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor, persistent_workers=True,collate_fn=TracksterDataset.collate_fn)
-    test_loader = DataLoader(test_data, batch_size=batch_size,collate_fn=TracksterDataset.collate_fn)
-    return train_loader, val_loader, test_loader
+    test_loader = DataLoader(test_data, batch_size=8*batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
+                             persistent_workers=True, collate_fn=TracksterDataset.collate_fn)
+    if not test:
+        train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=workers,
+                                  prefetch_factor=prefetch_factor, persistent_workers=True,
+                                  collate_fn=TracksterDataset.collate_fn)
+        val_loader = DataLoader(val_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
+                                persistent_workers=True, collate_fn=TracksterDataset.collate_fn)
+        return train_loader, val_loader, test_loader
+    else:
+        return test_loader
 
 
 def get_trainer(epochs, gpus, tag):
     logger = TensorBoardLogger(save_dir="tb_logs", name=tag)
     if gpus == 1:
-        trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger)
+        trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger, auto_lr_find=True,
+                             gradient_clip_val=1., callbacks=[StochasticWeightAveraging(0.5)])
     else:
         trainer = pl.Trainer(gpus=gpus, precision=32, strategy=DDPPlugin(find_unused_parameters=False),
-                             max_epochs=epochs, logger=logger, num_sanity_val_steps=0)
+                             max_epochs=epochs, logger=logger, num_sanity_val_steps=0, gradient_clip_val=1.,
+                             callbacks=[StochasticWeightAveraging(0.5)])
     return trainer
-
-
-def train_synthetic_data(batch_size, workers, args, epochs, training_fraction=0.75):
-    dataset = SyntheticData(1000)
-    splits = [math.ceil(i * len(dataset)) for i in
-              [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
-    while sum(splits) > len(dataset):
-        splits[-1] -= 1
-    train_data, val_data, test_data = random_split(dataset, splits, generator=torch.Generator())
-    train_loader = DataLoader(train_data, batch_size=batch_size,
-                              collate_fn=TracksterDataset.collate_fn)
-    val_loader = DataLoader(val_data, batch_size=batch_size,
-                            collate_fn=TracksterDataset.collate_fn)
-    test_loader = DataLoader(test_data, batch_size=batch_size, collate_fn=TracksterDataset.collate_fn)
-    pl.seed_everything(42)
-    model = GMNN(16, 10, 0, 10, dropout=0.2, num_steps=2, teacher_forcing=0.5, include_features=False)
-    trainer = get_trainer(20, 1, "gmnn_synthetic")
-    trainer.fit(model, train_loader, val_loader)
-    return model

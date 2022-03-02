@@ -13,7 +13,22 @@ from model.modules import GATBackbone, GMMBackbone, GeneralBackbone
 
 
 class TIGMN(pl.LightningModule):
-    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2, backbone='gat'):
+
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        parser = parent_parser.add_argument_group("TIGMN")
+        parser.add_argument("--hidden_dim", type=int, default=128,
+                            help="number of hidden features to use")
+        parser.add_argument("--num_gnn_steps", type=int, default=3,
+                            help="number of message passing steps to use for p and q")
+        parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train q in every iteration")
+        parser.add_argument("--learning_rate", type=float, default=1e-3, help="learning rate to train with")
+        parser.add_argument("--dropout", type=float, default=0., help="Dropout after every layer")
+        parser.add_argument("--backbone", type=str, default="ggsnn", help="Backbone convolution to use")
+        return parent_parser
+
+    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2,
+                 backbone='ggsnn'):
         super(TIGMN, self).__init__()
         self.save_hyperparameters()
         assert backbone in ['gat', 'ggsnn', 'tag', 'gmm']
@@ -23,18 +38,20 @@ class TIGMN(pl.LightningModule):
             self.e = GMMBackbone(num_h_feats, in_feats, num_steps=num_steps)
         else:
             self.e = GeneralBackbone(num_h_feats, in_feats, num_steps=num_steps, convoperator=backbone)
+        self.dropout = nn.Dropout(dropout)
         self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
         self.node_generator = nn.Linear(num_h_feats, num_classes)
 
     def configure_optimizers(self):
         lr = self.hparams.lr
-        opt = torch.optim.RMSprop(self.parameters(), lr=lr)
+        opt = torch.optim.Adam(self.parameters(), lr=lr)
         return opt
 
     def forward(self, g):
         feats = g.ndata["x"]
-        prop_graph = dgl.add_self_loop(dgl.add_reverse_edges(g))
+        prop_graph = dgl.add_reverse_edges(g)
         h = self.e(prop_graph, feats)
+        h = self.dropout(h)
         g.ndata["feat"] = h
         g = self.generate_edge_factors(g)
         g.ndata["out"] = self.node_generator(h)
@@ -44,12 +61,13 @@ class TIGMN(pl.LightningModule):
         labels = batch.ndata["y"]
         pgm = self(batch)
         likelihood = self.sum_likelihood(pgm, labels) - self.partition_function(pgm)
-        likelihood = likelihood/len(labels)
+        likelihood = likelihood / len(labels)
         loss = -likelihood
-        sample = self.sample(pgm)
+
         self.log(f"{tag}_log_likelihood", likelihood, sync_dist=True)
-        self.log(f"{tag}_accuracy", (labels == sample).float().mean(), prog_bar=False, on_epoch=True, on_step=True,
-                 sync_dist=True, batch_size=1)
+        self.log(f"{tag}_loss", loss, sync_dist=True)
+        if tag == "val":
+            self.log("hp_metric", likelihood, sync_dist=True)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -57,6 +75,24 @@ class TIGMN(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         self.step(batch, "val")
+
+    def test_step(self, batch, batch_idx):
+        labels = batch.ndata["y"]
+        pgm = self(batch)
+        likelihood = self.sum_likelihood(pgm, labels) - self.partition_function(pgm)
+        likelihood = likelihood / len(labels)
+        loss = -likelihood
+        self.log("test_loss", loss)
+        self.log("test_likelihood", likelihood)
+        samples = self.sample(pgm, 1000)
+        pgm.ndata["sample"] = samples.T
+        for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
+            labels = g.ndata["y"]
+            samples = trackster.ndata["sample"].T
+            acc = (torch.sum(torch.sum(samples == labels, dim=-1) == g.number_of_nodes())) / len(samples)
+            if torch.sum(labels) > 0:
+                self.log("prunable_test_acc", acc, prog_bar=True)
+            self.log("test_acc", acc, prog_bar=True)
 
     def generate_edge_factors(self, g):
         g.apply_edges(self.concat_message_function)
@@ -75,29 +111,33 @@ class TIGMN(pl.LightningModule):
 
     @staticmethod
     def sum_likelihood(pgm, labels):
-        pgm.apply_nodes(lambda nodes: {"c": nodes.data["out"][F.one_hot(labels, num_classes = 2).bool()]})
+        pgm.apply_nodes(lambda nodes: {"c": nodes.data["out"][F.one_hot(labels, num_classes=2).bool()]})
         pgm.apply_edges(TIGMN.edge_output)
         return torch.sum(pgm.ndata["c"]) + torch.sum(pgm.edata["c"])
 
     @staticmethod
-    def sample(pgm):
+    def sample(pgm, steps):
         o, t = pgm.edges()
         order = dgl.topological_nodes_generator(pgm)
-        pgm = dgl.add_edges(pgm, t, o, data={"out": torch.transpose(pgm.edata["out"].reshape((-1, 2, 2)), 1,2).reshape((-1, 4))})
+        pgm = dgl.add_edges(pgm, t, o,
+                            data={"out": torch.transpose(pgm.edata["out"].reshape((-1, 2, 2)), 1, 2).reshape((-1, 4))})
         pgm.pull(pgm.nodes(), TIGMN.receive_sample_init_msg, fn.sum('factor', 'fct'))
         pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
         pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
-        for i in range(3):
+        samples = torch.zeros((steps - 10, pgm.number_of_nodes()), device=pgm.device)
+        for i in range(steps):
             for nodes in order:
                 nodes = nodes.to(pgm.device)
                 pgm.pull(nodes, TIGMN.receive_sample_loopy_msg, fn.sum('factor', 'fct'))
                 pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
                 pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
-        return torch.argmax(pgm.ndata["label"], dim=-1)
+            if i >= 10:
+                samples[i - 10] = torch.argmax(pgm.ndata["label"], dim=-1)
+        return samples
 
     @staticmethod
     def edge_output(edges):
-        labels = F.one_hot(edges.src["y"] + 2 * edges.dst["y"], num_classes = 4).bool()
+        labels = F.one_hot(edges.src["y"] + 2 * edges.dst["y"], num_classes=4).bool()
         return {"c": edges.data["out"][labels]}
 
     @staticmethod
@@ -121,24 +161,16 @@ class TIGMN(pl.LightningModule):
         return {"factor": torch.transpose(edges.data["out"].reshape((-1, 2, 2)), 1, 2)[edges.src["label"].bool()]}
 
 
-
 class GMNN(pl.LightningModule):
 
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group("GMNN")
-        parser.add_argument("--hidden_dim", type=int, default=128,
-                            help="number of hidden features to use")
-        parser.add_argument("--num_gnn_steps", type=int, default=3,
-                            help="number of message passing steps to use for p and q")
-        parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train q in every iteration")
-        parser.add_argument("--learning_rate", type=float, default=1e-3, help="learning rate to train with")
-        parser.add_argument("--in_dropout", type=float, default=0.5, help="Dropout factor on the input")
-        parser.add_argument("--dropout", type=float, default=0., help="Dropout after every layer")
         parser.add_argument("--include_features", action='store_true')
         return parent_parser
 
-    def __init__(self, num_h_feats, in_feats=3, dropout=0.5, num_classes=2, lr=0.001, num_steps=2, include_features=True, epochs=100):
+    def __init__(self, num_h_feats, in_feats=3, dropout=0.5, num_classes=2, lr=0.001, num_steps=2,
+                 include_features=True, epochs=100):
         super(GMNN, self).__init__()
         self.save_hyperparameters()
         self.q = GATBackbone(num_h_feats, in_feats, dropout=dropout, num_classes=num_classes, num_steps=num_steps)
@@ -168,7 +200,7 @@ class GMNN(pl.LightningModule):
         features = g.ndata["x"]
         labels = g.ndata["y"]
         out_q = self.q(g, features)
-        #weights = self._calculate_weights(labels)
+        # weights = self._calculate_weights(labels)
         in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
         q_loss = F.cross_entropy(out_q, labels)
         pred = torch.argmax(F.softmax(out_q, dim=-1), dim=-1).detach()
@@ -231,5 +263,6 @@ class GMNN(pl.LightningModule):
     def log_results(self, loss, pred, labels, tag):
         self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
                  sync_dist=True, batch_size=1)
-        self.log("hp_metric", loss, sync_dist=True, batch_size=1)
+        self.log("hp_metric", -loss, sync_dist=True, batch_size=1)
+        self.log(f"{tag}_log_likelihood", -loss, sync_dist=True)
         self.log(f"{tag}_loss", loss, prog_bar=True, sync_dist=True, batch_size=1)

@@ -9,7 +9,7 @@ def parse_trainer(parser):
     parser.add_argument("--batch_size", type=int, help="Batch size to use during training", default=1)
     parser.add_argument("--workers", type=int, help="Number of worker threads to use for data fetching", default=8)
     parser.add_argument("--seed", type=int, help="Seed to use for random sampling", default=42)
-    parser.add_argument("--output_file", type=str, help="File to write output model to", default="gmnn.pt")
+    parser.add_argument("--output_file", type=str, help="File to write output model to", default="tigmn.pt")
     parser.add_argument("--gpus", type=int, help="Number of GPU's to train on", default=torch.cuda.device_count())
     return parser
 
