@@ -10,6 +10,7 @@ from dgl.nn.pytorch import SAGEConv, GraphConv, GATConv, Sequential
 import numpy as np
 import dgl.function as fn
 from model.modules import GATBackbone, GMMBackbone, GeneralBackbone
+import collections
 
 
 class TIGMN(pl.LightningModule):
@@ -89,10 +90,28 @@ class TIGMN(pl.LightningModule):
         for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
             labels = g.ndata["y"]
             samples = trackster.ndata["sample"].T
-            acc = (torch.sum(torch.sum(samples == labels, dim=-1) == g.number_of_nodes())) / len(samples)
-            if torch.sum(labels) > 0:
-                self.log("prunable_test_acc", acc, prog_bar=True)
-            self.log("test_acc", acc, prog_bar=True)
+            samples_strings = [tuple(row) for row in samples.tolist()]
+            counter = collections.Counter(samples_strings)
+            top_20 = counter.most_common(20)
+            label_str = ''.join(str(item) for item in labels.tolist())
+            occurrence = 21
+            for n in range(min(20, len(top_20))):
+                sample_str = ''.join(str(item) for item in top_20[n][0])
+                if sample_str == label_str:
+                    occurrence = n
+                    break
+            for n in range(20):
+                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n))
+                if torch.sum(labels) > 0:
+                    self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
+            if torch.sum(labels) > 0.05 * len(labels):
+                subgraphs = g.subgraph(labels.bool())
+                if len(dgl.topological_nodes_generator(subgraphs)) > 2:
+                    for n in range(20):
+                        self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
+
+
+
 
     def generate_edge_factors(self, g):
         g.apply_edges(self.concat_message_function)
@@ -124,7 +143,7 @@ class TIGMN(pl.LightningModule):
         pgm.pull(pgm.nodes(), TIGMN.receive_sample_init_msg, fn.sum('factor', 'fct'))
         pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
         pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
-        samples = torch.zeros((steps - 10, pgm.number_of_nodes()), device=pgm.device)
+        samples = torch.zeros((steps - 10, pgm.number_of_nodes()), device=pgm.device, dtype=torch.uint8)
         for i in range(steps):
             for nodes in order:
                 nodes = nodes.to(pgm.device)
@@ -259,6 +278,44 @@ class GMNN(pl.LightningModule):
             self.q_step(batch, "val")
         else:
             self.p_step(batch, "val")
+
+
+    def test_step(self, batch, batch_idx):
+        g = dgl.add_self_loop(dgl.add_reverse_edges(batch))
+        _, opt = self.optimizers()
+        features = g.ndata["x"]
+        out_q = self.q(g, features)
+
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        in_p = self.aggregation(in_p, features).detach()
+        out_p = self.p(g, in_p)
+        samples = torch.zeros((1000, g.number_of_nodes()), dtype=torch.uint8, device=batch.device)
+        for i in range(1000):
+            samples[i] = torch.argmax(F.gumbel_softmax(out_p, hard=True), dim=-1)
+        batch.ndata["sample"] = samples.T
+        for graph in dgl.unbatch(batch):
+            labels = graph.ndata["y"]
+            samples = graph.ndata["sample"].T
+            samples_strings = [tuple(row) for row in samples.tolist()]
+            counter = collections.Counter(samples_strings)
+            top_20 = counter.most_common(20)
+            label_str = ''.join(str(item) for item in labels.tolist())
+            occurrence = 21
+            for n in range(min(20, len(top_20))):
+                sample_str = ''.join(str(item) for item in top_20[n][0])
+                if sample_str == label_str:
+                    occurrence = n
+                    break
+            for n in range(20):
+                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n))
+                if torch.sum(labels) > 0:
+                    self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
+            if torch.sum(labels) > 0.05 * len(labels):
+                subgraphs = graph.subgraph(labels.bool())
+                if len(dgl.topological_nodes_generator(subgraphs)) > 2:
+                    for n in range(20):
+                        self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
+
 
     def log_results(self, loss, pred, labels, tag):
         self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,

@@ -10,6 +10,7 @@ import math
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.plugins import DDPPlugin
 from pytorch_lightning.callbacks.stochastic_weight_avg import StochasticWeightAveraging
+import json
 
 
 def gridsearch(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed,
@@ -32,12 +33,15 @@ def gridsearch(batch_size, training_fraction, epochs, workers, prefetch_factor, 
 def train(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
           num_gnn_steps,
           learning_rate, gpus, dropout):
-    train_loader, val_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
+    train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                                             workers, prefetch_factor)
     pl.seed_everything(seed)
     model = GMNN(num_h_feats=hidden_dim, in_feats=9, epochs=epochs, num_steps=num_gnn_steps, dropout=dropout)
     trainer = get_trainer(epochs, gpus, "gmnn")
     trainer.fit(model, train_loader, val_loader)
+    test_metrics = trainer.test(dataloaders=test_loader, ckpt_path="best")[0]
+    with open(f'gmnn-{sampling_fraction}-{hidden_dim}-{num_gnn_steps}-{epochs}.json', 'w') as f:
+        json.dump(test_metrics, f)
     return model
 
 
@@ -51,16 +55,11 @@ def train_tigmn(batch_size, training_fraction, epochs, workers, prefetch_factor,
     trainer = get_trainer(epochs, gpus, "tigmn")
     trainer.tune(model, train_loader, val_loader)
     trainer.fit(model, train_loader, val_loader)
-    trainer.test(model, test_loader)
+    test_metrics = trainer.test(model, test_loader, ckpt_path="best")[0]
+    with open(f'{backbone}-{sampling_fraction}-{hidden_dim}-{num_gnn_steps}-{epochs}.json', 'w') as f:
+        json.dump(test_metrics, f)
     return model
 
-
-def test_tigmn(training_fraction, workers, prefetch_factor, sampling_fraction, seed, hidden_dim, num_gnn_steps, gpus=1):
-    pl.seed_everything(seed)
-    test_loader = prepare_data(sampling_fraction, training_fraction, seed, 128, workers, prefetch_factor, test=True)
-    model = TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=.1, lr=.001, backbone='ggsnn')
-    trainer = get_trainer(1, gpus, "tigmn")
-    trainer.test(model, test_loader)
 
 
 def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
@@ -72,14 +71,14 @@ def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
     while sum(splits) > len(dataset):
         splits[-1] -= 1
     train_data, val_data, test_data = random_split(dataset, splits, generator=torch.Generator().manual_seed(seed))
-    test_loader = DataLoader(test_data, batch_size=8*batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
-                             persistent_workers=True, collate_fn=TracksterDataset.collate_fn)
+    test_loader = DataLoader(test_data, batch_size=16*batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
+                             persistent_workers=False, collate_fn=TracksterDataset.collate_fn)
     if not test:
         train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=workers,
-                                  prefetch_factor=prefetch_factor, persistent_workers=True,
+                                  prefetch_factor=prefetch_factor, persistent_workers=False,
                                   collate_fn=TracksterDataset.collate_fn)
         val_loader = DataLoader(val_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
-                                persistent_workers=True, collate_fn=TracksterDataset.collate_fn)
+                                persistent_workers=False, collate_fn=TracksterDataset.collate_fn)
         return train_loader, val_loader, test_loader
     else:
         return test_loader
@@ -87,9 +86,12 @@ def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
 
 def get_trainer(epochs, gpus, tag):
     logger = TensorBoardLogger(save_dir="tb_logs", name=tag)
+    if tag == "gmnn":
+        trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger)
+        return trainer
     if gpus == 1:
         trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger, auto_lr_find=True,
-                             gradient_clip_val=1., callbacks=[StochasticWeightAveraging(0.5)])
+                             gradient_clip_val=1.,callbacks=[StochasticWeightAveraging(0.5)])
     else:
         trainer = pl.Trainer(gpus=gpus, precision=32, strategy=DDPPlugin(find_unused_parameters=False),
                              max_epochs=epochs, logger=logger, num_sanity_val_steps=0, gradient_clip_val=1.,
