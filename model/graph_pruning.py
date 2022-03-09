@@ -39,7 +39,8 @@ class TIGMN(pl.LightningModule):
             self.e = GMMBackbone(num_h_feats, in_feats, num_steps=num_steps)
         else:
             self.e = GeneralBackbone(num_h_feats, in_feats, num_steps=num_steps, convoperator=backbone)
-        self.dropout = nn.Dropout(dropout)
+        if backbone != 'gat':
+            self.dropout = nn.Dropout(dropout)
         self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
         self.node_generator = nn.Linear(num_h_feats, num_classes)
 
@@ -52,7 +53,8 @@ class TIGMN(pl.LightningModule):
         feats = g.ndata["x"]
         prop_graph = dgl.add_reverse_edges(g)
         h = self.e(prop_graph, feats)
-        h = self.dropout(h)
+        if self.hparams.backbone != 'gat':
+            h = self.dropout(h)
         g.ndata["feat"] = h
         g = self.generate_edge_factors(g)
         g.ndata["out"] = self.node_generator(h)
@@ -85,7 +87,7 @@ class TIGMN(pl.LightningModule):
         loss = -likelihood
         self.log("test_loss", loss)
         self.log("test_likelihood", likelihood)
-        samples = self.sample(pgm, 1000)
+        samples = self.sample(pgm, 1010)
         pgm.ndata["sample"] = samples.T
         for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
             labels = g.ndata["y"]
@@ -93,6 +95,8 @@ class TIGMN(pl.LightningModule):
             samples_strings = [tuple(row) for row in samples.tolist()]
             counter = collections.Counter(samples_strings)
             top_20 = counter.most_common(20)
+            for i, entry in enumerate(top_20):
+                self.log(f"top-{i + 1}-mass", entry[1] / 1000)
             label_str = ''.join(str(item) for item in labels.tolist())
             occurrence = 21
             for n in range(min(20, len(top_20))):
@@ -104,11 +108,10 @@ class TIGMN(pl.LightningModule):
                 self.log(f"top-{n + 1}-accuracy", int(occurrence <= n))
                 if torch.sum(labels) > 0:
                     self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
-            if torch.sum(labels) > 0.05 * len(labels):
-                subgraphs = g.subgraph(labels.bool())
-                if len(dgl.topological_nodes_generator(subgraphs)) > 2:
-                    for n in range(20):
-                        self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
+            subgraphs = g.subgraph(labels.bool())
+            if len(dgl.topological_nodes_generator(subgraphs)) > 2:
+                for n in range(20):
+                    self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
 
 
 
@@ -282,7 +285,6 @@ class GMNN(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         g = dgl.add_self_loop(dgl.add_reverse_edges(batch))
-        _, opt = self.optimizers()
         features = g.ndata["x"]
         out_q = self.q(g, features)
 
@@ -299,6 +301,8 @@ class GMNN(pl.LightningModule):
             samples_strings = [tuple(row) for row in samples.tolist()]
             counter = collections.Counter(samples_strings)
             top_20 = counter.most_common(20)
+            for i, entry in enumerate(top_20):
+                self.log(f"top-{i + 1}-mass", entry[1] / 1000)
             label_str = ''.join(str(item) for item in labels.tolist())
             occurrence = 21
             for n in range(min(20, len(top_20))):

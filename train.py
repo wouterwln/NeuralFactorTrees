@@ -10,6 +10,7 @@ import math
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.plugins import DDPPlugin
 from pytorch_lightning.callbacks.stochastic_weight_avg import StochasticWeightAveraging
+from pytorch_lightning.callbacks import ModelCheckpoint
 import json
 
 
@@ -39,9 +40,12 @@ def train(batch_size, training_fraction, epochs, workers, prefetch_factor, sampl
     model = GMNN(num_h_feats=hidden_dim, in_feats=9, epochs=epochs, num_steps=num_gnn_steps, dropout=dropout)
     trainer = get_trainer(epochs, gpus, "gmnn")
     trainer.fit(model, train_loader, val_loader)
-    test_metrics = trainer.test(dataloaders=test_loader, ckpt_path="best")[0]
-    with open(f'gmnn-{sampling_fraction}-{hidden_dim}-{num_gnn_steps}-{epochs}.json', 'w') as f:
-        json.dump(test_metrics, f)
+    metrics = []
+    for i in range(2):
+        metrics.extend(trainer.test(model, dataloaders=test_loader[i], ckpt_path="best"))
+    for i, m in enumerate(metrics):
+        with open(f'gmnn-{sampling_fraction}-{hidden_dim}-{num_gnn_steps}-{epochs}-{i}.json', 'w') as f:
+            json.dump(m, f)
     return model
 
 
@@ -55,9 +59,12 @@ def train_tigmn(batch_size, training_fraction, epochs, workers, prefetch_factor,
     trainer = get_trainer(epochs, gpus, "tigmn")
     trainer.tune(model, train_loader, val_loader)
     trainer.fit(model, train_loader, val_loader)
-    test_metrics = trainer.test(model, test_loader, ckpt_path="best")[0]
-    with open(f'{backbone}-{sampling_fraction}-{hidden_dim}-{num_gnn_steps}-{epochs}.json', 'w') as f:
-        json.dump(test_metrics, f)
+    metrics=[]
+    for i in range(2):
+        metrics.extend(trainer.test(model, dataloaders=test_loader[i], ckpt_path="best"))
+    for i, m in enumerate(metrics):
+        with open(f'{backbone}-{sampling_fraction}-{hidden_dim}-{num_gnn_steps}-{epochs}-{i}.json', 'w') as f:
+            json.dump(m, f)
     return model
 
 
@@ -65,14 +72,17 @@ def train_tigmn(batch_size, training_fraction, epochs, workers, prefetch_factor,
 def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                  workers, prefetch_factor, memset=TracksterDataset, test=False):
     dataset = memset("tracksters_preprocessed.root", "Tracksters;1", "Edges;1")
+    test_data_diphoton = TracksterDataset("tracksters_preprocessed_diphoton.root", "Tracksters;1", "Edges;1")
     dataset = Subset(dataset, [i for i in range(math.floor(sampling_fraction * len(dataset)))])
     splits = [math.ceil(i * len(dataset)) for i in
               [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
     while sum(splits) > len(dataset):
         splits[-1] -= 1
     train_data, val_data, test_data = random_split(dataset, splits, generator=torch.Generator().manual_seed(seed))
-    test_loader = DataLoader(test_data, batch_size=16*batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
-                             persistent_workers=False, collate_fn=TracksterDataset.collate_fn)
+    test_loader = [DataLoader(test_data, batch_size=16*batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
+                             persistent_workers=False, collate_fn=TracksterDataset.collate_fn)]
+    test_loader.append(DataLoader(test_data_diphoton, batch_size=16*batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
+                             persistent_workers=False, collate_fn=TracksterDataset.collate_fn))
     if not test:
         train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=workers,
                                   prefetch_factor=prefetch_factor, persistent_workers=False,
@@ -86,12 +96,13 @@ def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
 
 def get_trainer(epochs, gpus, tag):
     logger = TensorBoardLogger(save_dir="tb_logs", name=tag)
+    checkpoint_callback = ModelCheckpoint(monitor="val_loss")
     if tag == "gmnn":
         trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger)
         return trainer
     if gpus == 1:
         trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger, auto_lr_find=True,
-                             gradient_clip_val=1.,callbacks=[StochasticWeightAveraging(0.5)])
+                             gradient_clip_val=1.,callbacks=[StochasticWeightAveraging(0.5), checkpoint_callback])
     else:
         trainer = pl.Trainer(gpus=gpus, precision=32, strategy=DDPPlugin(find_unused_parameters=False),
                              max_epochs=epochs, logger=logger, num_sanity_val_steps=0, gradient_clip_val=1.,
