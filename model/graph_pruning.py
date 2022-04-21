@@ -1,187 +1,410 @@
+from copy import deepcopy
+
+import dgl.nn.pytorch
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger
-
-from model.modules import *
+from torch import nn
 import torch
-import abc
 import torch.nn.functional as F
-from sklearn.metrics import precision_score, recall_score
+import dgl.function as fn
+from model.modules import GATBackbone, GMMBackbone, GeneralBackbone, MultiLayeredGatedGraphConv
+import collections
+from dgl.nn.pytorch import GatedGraphConv, HGTConv
+from tqdm import trange
 
 
-class GraphPruner(pl.LightningModule):
+class TIGMN(pl.LightningModule):
 
     @staticmethod
     def add_model_specific_args(parent_parser):
-        parser = parent_parser.add_argument_group("GraphPruningModel")
-        parser.add_argument("--hidden_dim", type=int, default=128, help="number of hidden features to use (for node embeddings and gating mechanisms)")
-        parser.add_argument("--num_gnn_steps", type=int, default=3, help="number of GNN layers used in every iteration")
-        parser.add_argument("--num_iterations", type=int, default=5, help="number of iterations used for equilibrium finding modules")
-        parser.add_argument("--aggregator", type=str, default='lstm', help="aggregator gating mechanism to use (either lstm or gru)")
-        parser.add_argument("--memory", type=str, default='none', help="memory type to use (gru, lstm or none) to add memory of node embeddings")
+        parser = parent_parser.add_argument_group("TIGMN")
+        parser.add_argument("--hidden_dim", type=int, default=128,
+                            help="number of hidden features to use")
+        parser.add_argument("--num_gnn_steps", type=int, default=8,
+                            help="number of message passing steps to use for p and q")
+        parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train q in every iteration")
         parser.add_argument("--learning_rate", type=float, default=1e-3, help="learning rate to train with")
-        parser.add_argument("--autoregressive", action="store_true", help="use this flag to train autoregressive model instead of equilibrium finding")
+        parser.add_argument("--dropout", type=float, default=0.1, help="Dropout after every layer")
+        parser.add_argument("--backbone", type=str, default="ggsnn", help="Backbone convolution to use")
+        parser.add_argument("--num_layers", type=int, default=3, help="Number of layers in MLP to compute messages")
+        parser.add_argument("--hgt", action='store_true')
         return parent_parser
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        return optimizer
-
-    def training_step(self, train_batch, batch_idx):
-        return self.step(train_batch, "train")
-
-    def validation_step(self, val_batch, batch_idx):
-        self.step(val_batch, "val")
-
-    def forward(self, g, in_feat):
-        if self.autoregressive:
-            return self._step_autoregressive(g, in_feat)
+    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2,
+                 backbone='ggsnn', num_layers=3):
+        super(TIGMN, self).__init__()
+        self.save_hyperparameters()
+        assert backbone in ['gat', 'ggsnn', 'tag', 'gmm']
+        if backbone == 'gat':
+            self.e = GATBackbone(num_h_feats, in_feats, dropout, num_classes=num_h_feats, num_steps=num_steps)
+        elif backbone == 'gmm':
+            self.e = GMMBackbone(num_h_feats, in_feats, num_steps=num_steps)
         else:
-            return self._step_eqfinding(g, in_feat)
+            self.e = GeneralBackbone(num_h_feats, in_feats, num_steps=num_steps, convoperator=backbone,
+                                     num_layers=num_layers)
+        if backbone != 'gat':
+            self.dropout = nn.Dropout(dropout)
+        self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
+        self.node_generator = nn.Linear(num_h_feats, num_classes)
+
+    def configure_optimizers(self):
+        lr = self.hparams.lr
+        opt = torch.optim.Adam(self.parameters(), lr=lr)
+        return opt
+
+    def forward(self, batch):
+        g, prop_graph, _ = batch
+        feats = g.ndata["x"]
+        h = self.e(prop_graph, feats)
+        if self.hparams.backbone != 'gat':
+            h = self.dropout(h)
+        g.ndata["feat"] = h
+        g = self.generate_edge_factors(g)
+        g.ndata["out"] = self.node_generator(h)
+        return g
 
     def step(self, batch, tag):
-        if self.autoregressive:
-            return self._step_autoregressive(batch, tag)
-        else:
-            return self._step_eqfinding(batch, tag)
+        labels = batch[0].ndata["y"]
+        pgm = self(batch)
+        likelihood = self.sum_likelihood(pgm, labels) - self.partition_function(pgm)
+        loss = -likelihood
+        likelihood = likelihood / len(labels)
 
-    @abc.abstractmethod
-    def _step_autoregressive(self, batch, tag):
-        pass
-
-    @abc.abstractmethod
-    def _step_eqfinding(self, batch, tag):
-        pass
-
-    @abc.abstractmethod
-    def _forward_autoregressive(self, g, in_feat):
-        pass
-
-    @abc.abstractmethod
-    def _forward_eqfinding(self, g, in_feat):
-        pass
-
-    def log_results(self, loss, pred, labels, tag):
-        self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False, sync_dist=True, batch_size=1)
-        if sum(labels) > 0:
-            self.log(f"{tag}_precision", precision_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False,
-                     on_epoch=True, on_step=False, sync_dist=True, batch_size=1)
-            self.log(f"{tag}_recall", recall_score(labels.cpu(), pred.cpu(), zero_division=0), prog_bar=False,
-                     on_epoch=True, on_step=False, sync_dist=True, batch_size=1)
-        self.log("hp_metric", loss, sync_dist=True, batch_size=1)
-        self.log(f"{tag}_loss", loss, on_epoch=True, prog_bar=False, on_step=False, sync_dist=True, batch_size=1)
-
-
-class GNNPruner(GraphPruner):
-    def __init__(self, in_feats, h_feats, num_gnn_steps, num_iterations, aggregator='lstm', lr=1e-3,
-                 autoregressive=False, memory='none'):
-        super(GraphPruner, self).__init__()
-        self.save_hyperparameters()
-        assert aggregator in ['gru', 'lstm']
-        self.agg = aggregator
-        self.memory_type = memory
-        self.in_read = Initializer(in_feats, h_feats)
-
-        if self.agg == 'gru':
-            self.aggregator = GRUCell(2, h_feats)
-        else:
-            self.aggregator = LSTMCell(2, h_feats)
-
-        if self.memory_type == 'gru':
-            self.mem = GRUCell(h_feats, h_feats)
-        elif self.memory_type == 'lstm':
-            self.mem = LSTMCell(h_feats, h_feats)
-        self.gnn = GNNCell(h_feats, num_gnn_steps, 2)
-
-        self.num_iterations = num_iterations
-        self.h_feats = h_feats
-
-        self.learning_rate = lr
-        self.autoregressive = autoregressive
-
-
-    def _step_autoregressive(self, batch, tag):
-        loss = 0
-        for g, labels in batch:
-            output = torch.zeros(g.number_of_nodes(), 2).to(g.device)
-            state = torch.zeros(g.number_of_nodes()).to(g.device)
-            seq = torch.zeros_like(output)
-            h = self.in_read(g.ndata["features"])
-            if self.agg == 'lstm':
-                c_a = torch.zeros_like(h)
-            if self.memory_type != 'none':
-                mh = torch.zeros_like(h)
-                if self.memory_type == "lstm":
-                    c_m = torch.zeros_like(h)
-            while sum(state) < g.number_of_nodes():
-                unseen = state == 0
-                if self.agg == 'lstm':
-                    h, c_a = self.aggregator(seq, (h, c_a))
-                else:
-                    h = self.aggregator(seq, h)
-                if self.memory_type != 'none':
-                    if self.memory_type == 'lstm':
-                        h, c_m = self.mem(h, (mh, c_m))
-                    elif self.memory_type == 'gru':
-                        h = self.mem(h, mh)
-                    mh = h
-                o, h, l = self.gnn(g, h)
-                scores = F.softmax(l[unseen].flatten(), dim=0)
-                hard = F.gumbel_softmax(l[unseen].flatten(), tau=1, hard=True)
-                chosen_node = torch.where(unseen)[0][torch.argmax(scores)]
-                state[chosen_node] = 1.
-                seq = torch.zeros_like(output)
-                seq[chosen_node, 0] = 1.
-                seq[chosen_node, 1] = labels[chosen_node]
-                weight = self._calculate_weights(labels[unseen])
-                loss += torch.sum(F.cross_entropy(o[unseen], labels[unseen].long(), reduction='none',
-                                         weight=weight) * scores)
-                output[chosen_node] = o[chosen_node]
-            loss = loss / g.number_of_nodes()
-            pred = torch.argmax(output, dim=1)
-            self.log_results(loss, pred, labels, tag)
+        self.log(f"{tag}_log_likelihood", likelihood, sync_dist=True)
+        self.log(f"{tag}_loss", -likelihood, sync_dist=True)
+        if tag == "val":
+            self.log("hp_metric", likelihood, sync_dist=True)
         return loss
 
-    def _step_eqfinding(self, batch, tag):
-        loss = 0
-        for g, labels in batch:
-            logits = self._forward_eqfinding(g, g.ndata["features"])
-            weight = self._calculate_weights(labels)
-            loss += F.cross_entropy(logits, labels.long(), weight=weight)
-            pred = torch.argmax(logits, dim=1)
-            self.log_results(loss, pred, labels, tag)
-        return loss
+    def training_step(self, batch, batch_idx):
+        return self.step(batch, "train")
 
-    def _forward_autoregressive(self, g, in_feat):
-        pass
+    def validation_step(self, batch, batch_idx):
+        self.step(batch, "val")
 
-    def _forward_eqfinding(self, g, in_feat):
-        h = self.in_read(in_feat)
-        x = torch.zeros(g.number_of_nodes(), 2).to(g.device)
-        if self.agg == 'lstm':
-            c_a = torch.zeros_like(h)
-        if self.memory_type != 'none':
-            mh = torch.zeros_like(h)
-            if self.memory_type == "lstm":
-                c_m = torch.zeros_like(h)
-        for i in range(self.num_iterations):
-            if self.agg == 'lstm':
-                h, c_a = self.aggregator(x, (h, c_a))
-            else:
-                h = self.aggregator(x, h)
-            if self.memory_type != 'none':
-                if self.memory_type == 'lstm':
-                    h, c_m = self.mem(h, (mh, c_m))
-                else:
-                    h = self.mem(h, mh)
-                mh = h
-            o, h, _ = self.gnn(g, h)
-            x = F.softmax(o, dim=1)
-        return o
+    def test_step(self, batch, batch_idx):
+        labels = batch[0].ndata["y"]
+        pgm = self(batch)
+        likelihood = self.sum_likelihood(pgm, labels) - self.partition_function(pgm)
+        likelihood = likelihood / len(labels)
+        loss = -likelihood
+        self.log("test_loss", loss)
+        self.log("test_likelihood", likelihood)
+        samples = self.sample(pgm, 1010)
+        pgm.ndata["sample"] = samples.T
+        batch = batch[0]
+        for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
+            labels = g.ndata["y"]
+            labels_bool = labels.bool()
+            energies = g.ndata["x"][:, 3]
+            samples = trackster.ndata["sample"].T
+            samples_strings = [tuple(row) for row in samples.tolist()]
+            counter = collections.Counter(samples_strings)
+            top_20 = counter.most_common(20)
+            for i, entry in enumerate(top_20):
+                self.log(f"top-{i + 1}-mass", entry[1] / 1000)
+            label_str = ''.join(str(item) for item in labels.tolist())
+            occurrence = 21
+            for n in range(min(20, len(top_20))):
+                sample_str = ''.join(str(item) for item in top_20[n][0])
+                if sample_str == label_str:
+                    occurrence = n
+                    break
+            for n in range(20):
+                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n))
+                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
+                if torch.sum(labels) > 0:
+                    self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
+                    self.log(f"prunable-top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
+            for n in range(20):
+                try:
+                    accuracy = torch.sum(torch.tensor(top_20[n][0], device=labels.device) == labels) / len(labels)
+                    self.log(f"node_wise_accuracy_{n + 1}", accuracy)
+                    self.log(f"node_wise_accuracy_{n + 1}_{len(labels)}", accuracy)
+                    frac_pruned = torch.ceil(20 * torch.mean(labels.float())) / 20
+                    self.log(f"node_wise_accuracy_{n + 1}_fraction_{frac_pruned}", accuracy)
+                except:
+                    continue
+                try:
+                    prediction = torch.tensor(top_20[n][0], device=labels.device)
+                    correctly_retained = torch.logical_and((labels == 0), (prediction == 0))
+                    correctly_pruned = torch.logical_and((labels == 1), (prediction == 1))
+                    energy_correctly_retained = torch.sum(energies[correctly_retained]) / torch.sum(
+                        energies[labels == 0])
+                    self.log(f"energy_correctly_retained_{n}", energy_correctly_retained)
+                    self.log(f"energy_correctly_retained_{n}_{len(labels)}", energy_correctly_retained)
+                    if torch.sum(labels) > 0:
+                        energy_correctly_pruned = torch.sum(energies[correctly_pruned]) / torch.sum(
+                            energies[labels == 1])
+                        self.log(f"energy_correctly_pruned_{n}", energy_correctly_pruned)
+                        self.log(f"energy_correctly_pruned_{n}_{len(labels)}", energy_correctly_pruned)
+                        self.log(f"sum_energy_pruned_retained_{n}", energy_correctly_pruned + energy_correctly_retained)
+                        self.log(f"sum_energy_pruned_retained_{n}_{len(labels)}",
+                                 energy_correctly_pruned + energy_correctly_retained)
+                    if torch.sum(labels) > 0.1 * len(labels):
+                        self.log(f"high_pruning_fr_energy_correctly_retained_{n}", energy_correctly_retained)
+                        self.log(f"high_pruning_fr_energy_correctly_retained_{n}_{len(labels)}",
+                                 energy_correctly_retained)
+                        self.log(f"high_pruning_fr_energy_correctly_pruned_{n}", energy_correctly_pruned)
+                        self.log(f"high_pruning_fr_energy_correctly_pruned_{n}_{len(labels)}", energy_correctly_pruned)
+                        self.log(f"high_pruning_fr_sum_energy_pruned_retained_{n}",
+                                 energy_correctly_pruned + energy_correctly_retained)
+                        self.log(f"high_pruning_fr_sum_energy_pruned_retained_{n}_{len(labels)}",
+                                 energy_correctly_pruned + energy_correctly_retained)
+                except:
+                    continue
+
+    def generate_edge_factors(self, g):
+        g.apply_edges(self.concat_message_function)
+        g.edata['out'] = self.edge_generator(g.edata['cat_feat'])
+        return g
 
     @staticmethod
-    def _calculate_weights(labels):
-        positives = max(1, torch.sum(labels == 1).detach())
-        negatives = max(1, torch.sum(labels == 0).detach())
-        frac = negatives / positives
-        weight = torch.tensor([1., frac], device=labels.device)
-        return weight
+    def partition_function(pgm):
+        order = dgl.topological_nodes_generator(pgm)
+        for nodes in order:
+            nodes = nodes.to(pgm.device)
+            pgm.pull(nodes, TIGMN.send_message, fn.sum('factor', 'fct'))
+            pgm.apply_nodes(lambda x: {'out': x.data['out'] + x.data['fct']}, nodes)
+        roots = dgl.topological_nodes_generator(pgm, reverse=True)[0].to(pgm.device)
+        return torch.sum(torch.logsumexp(pgm.ndata["out"][roots], dim=-1))
+
+    @staticmethod
+    def sum_likelihood(pgm, labels):
+        pgm.apply_nodes(lambda nodes: {"c": nodes.data["out"][F.one_hot(labels, num_classes=2).bool()]})
+        pgm.apply_edges(TIGMN.edge_output)
+        return torch.sum(pgm.ndata["c"]) + torch.sum(pgm.edata["c"])
+
+    @staticmethod
+    def sample(pgm, steps):
+        o, t = pgm.edges()
+        order = dgl.topological_nodes_generator(pgm)
+        pgm = dgl.add_edges(pgm, t, o,
+                            data={"out": torch.transpose(pgm.edata["out"].reshape((-1, 2, 2)), 1, 2).reshape((-1, 4))})
+        pgm.pull(pgm.nodes(), TIGMN.receive_sample_init_msg, fn.sum('factor', 'fct'))
+        pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
+        pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
+        samples = torch.zeros((steps - 10, pgm.number_of_nodes()), device=pgm.device, dtype=torch.uint8)
+        for i in range(steps):
+            for nodes in order:
+                nodes = nodes.to(pgm.device)
+                pgm.pull(nodes, TIGMN.receive_sample_loopy_msg, fn.sum('factor', 'fct'))
+                pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
+                pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
+            if i >= 10:
+                samples[i - 10] = torch.argmax(pgm.ndata["label"], dim=-1)
+        return samples
+
+    @staticmethod
+    def edge_output(edges):
+        labels = F.one_hot(edges.src["y"] + 2 * edges.dst["y"], num_classes=4).bool()
+        return {"c": edges.data["out"][labels]}
+
+    @staticmethod
+    def send_message(edges):
+        messages = edges.data["out"].reshape((-1, 2, 2)) + edges.src["out"].unsqueeze(1)
+        messages = torch.logsumexp(messages, dim=-1)
+        return {"factor": messages}
+
+    @staticmethod
+    def concat_message_function(edges):
+        return {'cat_feat': torch.cat([edges.src['feat'], edges.dst['feat']], dim=1)}
+
+    @staticmethod
+    def receive_sample_init_msg(edges):
+        messages = edges.data["out"].reshape((-1, 2, 2))
+        messages = torch.logsumexp(messages, dim=-1)
+        return {"factor": messages}
+
+    @staticmethod
+    def receive_sample_loopy_msg(edges):
+        return {"factor": torch.transpose(edges.data["out"].reshape((-1, 2, 2)), 1, 2)[edges.src["label"].bool()]}
+
+
+class MultiTST_TIGMN(TIGMN):
+    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2,
+                 backbone='ggsnn', num_layers=3):
+        super(TIGMN, self).__init__()
+        self.save_hyperparameters()
+        if num_layers > 1:
+            self.i = MultiLayeredGatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2,
+                                                n_layers=num_layers, dropout=dropout)
+        else:
+            self.i = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2)
+        if backbone != 'gat':
+            self.dropout = nn.Dropout(dropout)
+        self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
+        self.node_generator = nn.Linear(num_h_feats, num_classes)
+
+    def forward(self, batch):
+        g, prop_graph, etypes = batch
+        feats = g.ndata["x"]
+        h = self.i(prop_graph, feats, etypes)
+        if self.hparams.backbone != 'gat':
+            h = self.dropout(h)
+        g.ndata["feat"] = h
+        g = self.generate_edge_factors(g)
+        g.ndata["out"] = self.node_generator(h)
+        return g
+
+
+class HGTMultiTST_TIGMN(TIGMN):
+    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2):
+        super(TIGMN, self).__init__()
+        self.save_hyperparameters()
+
+        self.i = [HGTConv(in_feats, num_h_feats, 6, 1, 2, dropout=dropout)]
+        for _ in range(num_steps - 1):
+            self.i.append(HGTConv(num_h_feats, num_h_feats, 6, 1, 2, dropout=dropout))
+        self.i = nn.Sequential(*self.i)
+        self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
+        self.node_generator = nn.Linear(num_h_feats, num_classes)
+
+    def forward(self, batch):
+        g, prop_graph, etypes = batch
+        etypes = etypes.type(torch.int64)
+        ntypes = torch.zeros(prop_graph.number_of_nodes(), dtype=torch.int64, device=prop_graph.device)
+        h = g.ndata["x"]
+        for layer in self.i:
+            h = layer(prop_graph, h, ntypes, etypes).view((prop_graph.number_of_nodes(), 6, self.hparams.num_h_feats))
+            h = torch.sum(h, dim=1)
+        g.ndata["feat"] = h
+        g = self.generate_edge_factors(g)
+        g.ndata["out"] = self.node_generator(h)
+        return g
+
+
+class GMNN(pl.LightningModule):
+
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        parser = parent_parser.add_argument_group("GMNN")
+        parser.add_argument("--include_features", action='store_true')
+        return parent_parser
+
+    def __init__(self, num_h_feats, in_feats=3, dropout=0.5, num_classes=2, lr=0.001, num_steps=2,
+                 include_features=True, epochs=100):
+        super(GMNN, self).__init__()
+        self.save_hyperparameters()
+        self.q = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2)
+        self.p = GatedGraphConv(in_feats + 2, num_h_feats, n_steps=num_steps, n_etypes=2)
+        self.qlin = nn.Linear(num_h_feats, 2)
+        self.plin = nn.Linear(num_h_feats, 2)
+        if include_features:
+            self.aggregation = lambda x, y: torch.cat([x, y], dim=1)
+        else:
+            self.aggregation = lambda x, y: x
+        self.automatic_optimization = False
+
+    def configure_optimizers(self):
+        lr = self.hparams.lr
+
+        opt_q = torch.optim.RMSprop(self.q.parameters(), lr=lr)
+        opt_p = torch.optim.RMSprop(self.p.parameters(), lr=lr)
+        return opt_q, opt_p
+
+    def forward(self, g, feats):
+        out_q = self.q(g, feats)
+        out_q = self.qlin(out_q)
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        in_p = self.aggregation(in_p, feats)
+        out_p = self.p(g, in_p)
+        return out_p
+
+    def q_step(self, batch, tag):
+        _, g, etypes = batch
+        opt, _ = self.optimizers()
+        features = g.ndata["x"]
+        labels = g.ndata["y"]
+        out_q = self.q(g, features, etypes)
+        out_q = self.qlin(out_q)
+        # weights = self._calculate_weights(labels)
+        loss = F.cross_entropy(out_q, labels)
+        if tag == "train":
+            opt.zero_grad()
+            self.manual_backward(loss)
+            opt.step()
+        pred = torch.argmax(F.softmax(out_q, dim=-1), dim=-1).detach()
+        self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"q_{tag}")
+
+    def p_step(self, batch, tag):
+        _, g, etypes = batch
+        _, opt = self.optimizers()
+        features = g.ndata["x"]
+        labels = g.ndata["y"]
+        out_q = self.q(g, features, etypes)
+        out_q = self.qlin(out_q)
+        # weights = self._calculate_weights(labels)
+
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        in_p = self.aggregation(in_p, features).detach()
+        out_p = self.p(g, in_p, etypes)
+        out_p = self.plin(out_p)
+
+        loss = F.cross_entropy(out_p, labels)
+        if tag == "train":
+            opt.zero_grad()
+            self.manual_backward(loss)
+            opt.step()
+        pred = torch.argmax(F.softmax(out_p, dim=-1), dim=-1).detach()
+        self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"p_{tag}")
+
+    def training_step(self, batch, batch_idx):
+        if self.current_epoch < self.hparams.epochs // 2:
+            self.q_step(batch, "train")
+        else:
+            self.p_step(batch, "train")
+
+
+    def validation_step(self, batch, batch_idx):
+        if self.current_epoch < self.hparams.epochs // 2:
+            self.q_step(batch, "val")
+        else:
+            self.p_step(batch, "val")
+
+    def test_step(self, batch, batch_idx):
+        _, g, etypes = batch
+        features = g.ndata["x"]
+        out_q = self.q(g, features, etypes)
+        out_q = self.qlin(out_q)
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        in_p = self.aggregation(in_p, features).detach()
+        out_p = self.p(g, in_p, etypes)
+        out_p = self.plin(out_p)
+        samples = torch.zeros((1000, g.number_of_nodes()), dtype=torch.uint8, device=g.device)
+        for i in range(1000):
+            samples[i] = torch.argmax(F.gumbel_softmax(out_p, hard=True), dim=-1)
+        batch = batch[0]
+        batch.ndata["sample"] = samples.T
+        for graph in dgl.unbatch(batch):
+            labels = graph.ndata["y"]
+            samples = graph.ndata["sample"].T
+            samples_strings = [tuple(row) for row in samples.tolist()]
+            counter = collections.Counter(samples_strings)
+            top_20 = counter.most_common(20)
+            for i, entry in enumerate(top_20):
+                self.log(f"top-{i + 1}-mass", entry[1] / 1000)
+            label_str = ''.join(str(item) for item in labels.tolist())
+            occurrence = 21
+            for n in range(min(20, len(top_20))):
+                sample_str = ''.join(str(item) for item in top_20[n][0])
+                if sample_str == label_str:
+                    occurrence = n
+                    break
+            for n in range(20):
+                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n))
+                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
+                if torch.sum(labels) > 0:
+                    self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
+                    self.log(f"prunable-top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
+            if torch.sum(labels) > 0.05 * len(labels):
+                subgraphs = graph.subgraph(labels.bool())
+                if len(dgl.topological_nodes_generator(subgraphs)) > 2:
+                    for n in range(20):
+                        self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
+
+    def log_results(self, loss, pred, labels, tag):
+        self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
+                 sync_dist=True, batch_size=1)
+        self.log("hp_metric", -loss, sync_dist=True, batch_size=1)
+        self.log(f"{tag}_log_likelihood", -loss, sync_dist=True)
+        self.log(f"{tag}_loss", loss, prog_bar=True, sync_dist=True, batch_size=1)

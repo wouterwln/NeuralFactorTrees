@@ -1,14 +1,22 @@
+import os
+import sys
+sys.path.append(os.getcwd())
+
 from argparser import parse_trainer
 import argparse
-from model.graph_pruning import GraphPruner
-from train import train, gridsearch, train_synthetic_data
+from train import *
+import torch
+import warnings
+warnings.filterwarnings("ignore")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train the AutoRegressive Graph Pruning model on HGCAL data")
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    parser = argparse.ArgumentParser(description="Train the GMNN model on HGCAL data")
     parser = parse_trainer(parser)
-    parser = GraphPruner.add_model_specific_args(parser)
+    parser = TIGMN.add_model_specific_args(parser)
+    parser = GMNN.add_model_specific_args(parser)
     args = parser.parse_args()
-    #model = train(args.filename, args.trackster_root_name, args.edge_root_name, args.batch_size, args.training_fraction,
-    #              args.epochs, args.workers, args.prefetch_factor, args.sampling_fraction, args.seed, args.hidden_dim, args.num_gnn_steps, args.num_iterations, args.aggregator,
-    #               args.learning_rate, args.autoregressive, args.memory, args.gpus)
-    model = train_synthetic_data(1, 2, args, 100, )
+    train_intratrackster_model(args.batch_size, args.training_fraction, args.epochs, args.workers, args.prefetch_factor,
+                                       args.sampling_fraction, args.seed, args.hidden_dim, args.num_gnn_steps,
+                                        args.learning_rate, args.gpus, args.dropout, args.backbone, 10, args.num_layers,
+                               args.hgt)
