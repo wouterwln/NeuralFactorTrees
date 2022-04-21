@@ -18,4 +18,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     train_intratrackster_model(args.batch_size, args.training_fraction, args.epochs, args.workers, args.prefetch_factor,
                                        args.sampling_fraction, args.seed, args.hidden_dim, args.num_gnn_steps,
-                                        args.learning_rate, args.gpus, args.dropout, args.backbone, 10, args.num_layers)
+                                        args.learning_rate, args.gpus, args.dropout, args.backbone, 10, args.num_layers,
+                               args.hgt)

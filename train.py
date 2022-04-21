@@ -83,11 +83,14 @@ def get_trainer(epochs, gpus, tag):
     return trainer
 
 def train_intratrackster_model(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
-                num_gnn_steps, learning_rate, gpus, dropout, backbone, k, num_layers):
+                num_gnn_steps, learning_rate, gpus, dropout, backbone, k, num_layers, hgt):
     pl.seed_everything(seed)
     train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                                                          workers, prefetch_factor, k=k)
-    model = MultiTST_TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate, backbone=backbone, num_layers=num_layers)
+    if not hgt:
+        model = MultiTST_TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate, backbone=backbone, num_layers=num_layers)
+    else:
+        model = HGTMultiTST_TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate)
     trainer = get_trainer(epochs, gpus, "itt")
     #if gpus == 1:
     #    trainer.tune(model, train_loader, val_loader)
@@ -105,7 +108,10 @@ def continue_training(batch_size, training_fraction, epochs, workers, prefetch_f
                                                          workers, prefetch_factor, k=k)
 
     trainer = get_trainer(epochs, gpus, "itt")
-    model = MultiTST_TIGMN.load_from_checkpoint(ckpt, num_layers=num_layers)
+    try:
+        model = MultiTST_TIGMN.load_from_checkpoint(ckpt, num_layers=num_layers)
+    except:
+        model = HGTMultiTST_TIGMN.load_from_checkpoint(ckpt)
     trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt)
     metrics = trainer.test(model, dataloaders=test_loader, ckpt_path="best")
     for i, m in enumerate(metrics):
@@ -122,6 +128,6 @@ def test(batch_size, training_fraction, workers, prefetch_factor, sampling_fract
     model = MultiTST_TIGMN.load_from_checkpoint(ckpt, num_layers=num_layers)
     metrics = trainer.test(model, dataloaders=test_loader)
     for i, m in enumerate(metrics):
-        with open(f'results.json', 'w') as f:
+        with open(f'{ckpt}.json', 'w') as f:
             json.dump(m, f)
     return model

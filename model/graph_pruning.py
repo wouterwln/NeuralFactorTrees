@@ -8,7 +8,8 @@ import torch.nn.functional as F
 import dgl.function as fn
 from model.modules import GATBackbone, GMMBackbone, GeneralBackbone, MultiLayeredGatedGraphConv
 import collections
-from dgl.nn.pytorch import GatedGraphConv
+from dgl.nn.pytorch import GatedGraphConv, HGTConv
+from tqdm import trange
 
 
 class TIGMN(pl.LightningModule):
@@ -25,6 +26,7 @@ class TIGMN(pl.LightningModule):
         parser.add_argument("--dropout", type=float, default=0.1, help="Dropout after every layer")
         parser.add_argument("--backbone", type=str, default="ggsnn", help="Backbone convolution to use")
         parser.add_argument("--num_layers", type=int, default=3, help="Number of layers in MLP to compute messages")
+        parser.add_argument("--hgt", action='store_true')
         return parent_parser
 
     def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2,
@@ -37,7 +39,8 @@ class TIGMN(pl.LightningModule):
         elif backbone == 'gmm':
             self.e = GMMBackbone(num_h_feats, in_feats, num_steps=num_steps)
         else:
-            self.e = GeneralBackbone(num_h_feats, in_feats, num_steps=num_steps, convoperator=backbone, num_layers=num_layers)
+            self.e = GeneralBackbone(num_h_feats, in_feats, num_steps=num_steps, convoperator=backbone,
+                                     num_layers=num_layers)
         if backbone != 'gat':
             self.dropout = nn.Dropout(dropout)
         self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
@@ -91,6 +94,8 @@ class TIGMN(pl.LightningModule):
         batch = batch[0]
         for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
             labels = g.ndata["y"]
+            labels_bool = labels.bool()
+            energies = g.ndata["x"][:, 3]
             samples = trackster.ndata["sample"].T
             samples_strings = [tuple(row) for row in samples.tolist()]
             counter = collections.Counter(samples_strings)
@@ -110,13 +115,43 @@ class TIGMN(pl.LightningModule):
                 if torch.sum(labels) > 0:
                     self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
                     self.log(f"prunable-top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
-            subgraphs = g.subgraph(labels.bool())
-            if len(dgl.topological_nodes_generator(subgraphs)) > 2:
-                for n in range(20):
-                    self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
-
-
-
+            for n in range(20):
+                try:
+                    accuracy = torch.sum(torch.tensor(top_20[n][0], device=labels.device) == labels) / len(labels)
+                    self.log(f"node_wise_accuracy_{n + 1}", accuracy)
+                    self.log(f"node_wise_accuracy_{n + 1}_{len(labels)}", accuracy)
+                    frac_pruned = torch.ceil(20 * torch.mean(labels.float())) / 20
+                    self.log(f"node_wise_accuracy_{n + 1}_fraction_{frac_pruned}", accuracy)
+                except:
+                    continue
+                try:
+                    prediction = torch.tensor(top_20[n][0], device=labels.device)
+                    correctly_retained = torch.logical_and((labels == 0), (prediction == 0))
+                    correctly_pruned = torch.logical_and((labels == 1), (prediction == 1))
+                    energy_correctly_retained = torch.sum(energies[correctly_retained]) / torch.sum(
+                        energies[labels == 0])
+                    self.log(f"energy_correctly_retained_{n}", energy_correctly_retained)
+                    self.log(f"energy_correctly_retained_{n}_{len(labels)}", energy_correctly_retained)
+                    if torch.sum(labels) > 0:
+                        energy_correctly_pruned = torch.sum(energies[correctly_pruned]) / torch.sum(
+                            energies[labels == 1])
+                        self.log(f"energy_correctly_pruned_{n}", energy_correctly_pruned)
+                        self.log(f"energy_correctly_pruned_{n}_{len(labels)}", energy_correctly_pruned)
+                        self.log(f"sum_energy_pruned_retained_{n}", energy_correctly_pruned + energy_correctly_retained)
+                        self.log(f"sum_energy_pruned_retained_{n}_{len(labels)}",
+                                 energy_correctly_pruned + energy_correctly_retained)
+                    if torch.sum(labels) > 0.1 * len(labels):
+                        self.log(f"high_pruning_fr_energy_correctly_retained_{n}", energy_correctly_retained)
+                        self.log(f"high_pruning_fr_energy_correctly_retained_{n}_{len(labels)}",
+                                 energy_correctly_retained)
+                        self.log(f"high_pruning_fr_energy_correctly_pruned_{n}", energy_correctly_pruned)
+                        self.log(f"high_pruning_fr_energy_correctly_pruned_{n}_{len(labels)}", energy_correctly_pruned)
+                        self.log(f"high_pruning_fr_sum_energy_pruned_retained_{n}",
+                                 energy_correctly_pruned + energy_correctly_retained)
+                        self.log(f"high_pruning_fr_sum_energy_pruned_retained_{n}_{len(labels)}",
+                                 energy_correctly_pruned + energy_correctly_retained)
+                except:
+                    continue
 
     def generate_edge_factors(self, g):
         g.apply_edges(self.concat_message_function)
@@ -191,7 +226,8 @@ class MultiTST_TIGMN(TIGMN):
         super(TIGMN, self).__init__()
         self.save_hyperparameters()
         if num_layers > 1:
-            self.i = MultiLayeredGatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2, n_layers=num_layers, dropout=dropout)
+            self.i = MultiLayeredGatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2,
+                                                n_layers=num_layers, dropout=dropout)
         else:
             self.i = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2)
         if backbone != 'gat':
@@ -209,6 +245,33 @@ class MultiTST_TIGMN(TIGMN):
         g = self.generate_edge_factors(g)
         g.ndata["out"] = self.node_generator(h)
         return g
+
+
+class HGTMultiTST_TIGMN(TIGMN):
+    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2):
+        super(TIGMN, self).__init__()
+        self.save_hyperparameters()
+
+        self.i = [HGTConv(in_feats, num_h_feats, 6, 1, 2, dropout=dropout)]
+        for _ in range(num_steps - 1):
+            self.i.append(HGTConv(num_h_feats, num_h_feats, 6, 1, 2, dropout=dropout))
+        self.i = nn.Sequential(*self.i)
+        self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
+        self.node_generator = nn.Linear(num_h_feats, num_classes)
+
+    def forward(self, batch):
+        g, prop_graph, etypes = batch
+        etypes = etypes.type(torch.int64)
+        ntypes = torch.zeros(prop_graph.number_of_nodes(), dtype=torch.int64, device=prop_graph.device)
+        h = g.ndata["x"]
+        for layer in self.i:
+            h = layer(prop_graph, h, ntypes, etypes).view((prop_graph.number_of_nodes(), 6, self.hparams.num_h_feats))
+            h = torch.sum(h, dim=1)
+        g.ndata["feat"] = h
+        g = self.generate_edge_factors(g)
+        g.ndata["out"] = self.node_generator(h)
+        return g
+
 
 class GMNN(pl.LightningModule):
 
@@ -297,7 +360,6 @@ class GMNN(pl.LightningModule):
         else:
             self.p_step(batch, "val")
 
-
     def test_step(self, batch, batch_idx):
         _, g, etypes = batch
         features = g.ndata["x"]
@@ -338,7 +400,6 @@ class GMNN(pl.LightningModule):
                 if len(dgl.topological_nodes_generator(subgraphs)) > 2:
                     for n in range(20):
                         self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
-
 
     def log_results(self, loss, pred, labels, tag):
         self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
