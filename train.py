@@ -82,6 +82,7 @@ def get_trainer(epochs, gpus, tag):
                              callbacks=[StochasticWeightAveraging(0.5), checkpoint_callback, progress_bar])
     return trainer
 
+
 def train_intratrackster_model(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
                 num_gnn_steps, learning_rate, gpus, dropout, backbone, k, num_layers, hgt):
     pl.seed_everything(seed)
@@ -94,6 +95,7 @@ def train_intratrackster_model(batch_size, training_fraction, epochs, workers, p
     trainer = get_trainer(epochs, gpus, "itt")
     #if gpus == 1:
     #    trainer.tune(model, train_loader, val_loader)
+
     trainer.fit(model, train_loader, val_loader)
     metrics = trainer.test(model, dataloaders=test_loader, ckpt_path="best")
     for i, m in enumerate(metrics):

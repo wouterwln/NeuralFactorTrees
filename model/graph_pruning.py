@@ -354,6 +354,7 @@ class GMNN(pl.LightningModule):
         else:
             self.p_step(batch, "train")
 
+
     def validation_step(self, batch, batch_idx):
         if self.current_epoch < self.hparams.epochs // 2:
             self.q_step(batch, "val")
