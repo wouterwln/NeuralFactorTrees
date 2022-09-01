@@ -1,3 +1,4 @@
+import math
 from copy import deepcopy
 
 import dgl.nn.pytorch
@@ -63,16 +64,17 @@ class TIGMN(pl.LightningModule):
         return g
 
     def step(self, batch, tag):
-        labels = batch[0].ndata["y"]
-        pgm = self(batch)
+        batch_size = len(dgl.unbatch(batch))
+        labels = batch.ndata["y"]
+        pgm = self.forward(batch)
         likelihood = self.sum_likelihood(pgm, labels) - self.partition_function(pgm)
         loss = -likelihood
         likelihood = likelihood / len(labels)
 
-        self.log(f"{tag}_log_likelihood", likelihood, sync_dist=True)
-        self.log(f"{tag}_loss", -likelihood, sync_dist=True)
+        self.log(f"{tag}_log_likelihood", likelihood, sync_dist=True, batch_size=batch_size)
+        self.log(f"{tag}_loss", -likelihood, sync_dist=True, batch_size=batch_size)
         if tag == "val":
-            self.log("hp_metric", likelihood, sync_dist=True)
+            self.log("hp_metric", likelihood, sync_dist=True, batch_size=batch_size)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -170,7 +172,8 @@ class TIGMN(pl.LightningModule):
 
     @staticmethod
     def sum_likelihood(pgm, labels):
-        pgm.apply_nodes(lambda nodes: {"c": nodes.data["out"][F.one_hot(labels, num_classes=2).bool()]})
+        num_classes = pgm.ndata["out"].shape[1]
+        pgm.apply_nodes(lambda nodes: {"c": nodes.data["out"][F.one_hot(labels, num_classes=num_classes).bool()]})
         pgm.apply_edges(TIGMN.edge_output)
         return torch.sum(pgm.ndata["c"]) + torch.sum(pgm.edata["c"])
 
@@ -196,12 +199,14 @@ class TIGMN(pl.LightningModule):
 
     @staticmethod
     def edge_output(edges):
-        labels = F.one_hot(edges.src["y"] + 2 * edges.dst["y"], num_classes=4).bool()
+        num_classes = int(math.sqrt(edges.data["out"].shape[1]))
+        labels = F.one_hot(edges.src["y"] + num_classes * edges.dst["y"], num_classes=num_classes**2).bool()
         return {"c": edges.data["out"][labels]}
 
     @staticmethod
     def send_message(edges):
-        messages = edges.data["out"].reshape((-1, 2, 2)) + edges.src["out"].unsqueeze(1)
+        num_classes = int(math.sqrt(edges.data["out"].shape[1]))
+        messages = edges.data["out"].reshape((-1, num_classes, num_classes)) + edges.src["out"].unsqueeze(1)
         messages = torch.logsumexp(messages, dim=-1)
         return {"factor": messages}
 
@@ -211,13 +216,15 @@ class TIGMN(pl.LightningModule):
 
     @staticmethod
     def receive_sample_init_msg(edges):
-        messages = edges.data["out"].reshape((-1, 2, 2))
+        num_classes = int(math.sqrt(edges.data["out"].shape[1]))
+        messages = edges.data["out"].reshape((-1, num_classes, num_classes))
         messages = torch.logsumexp(messages, dim=-1)
         return {"factor": messages}
 
     @staticmethod
     def receive_sample_loopy_msg(edges):
-        return {"factor": torch.transpose(edges.data["out"].reshape((-1, 2, 2)), 1, 2)[edges.src["label"].bool()]}
+        num_classes = int(math.sqrt(edges.data["out"].shape[1]))
+        return {"factor": torch.transpose(edges.data["out"].reshape((-1, num_classes, num_classes)), 1, 2)[edges.src["label"].bool()]}
 
 
 class MultiTST_TIGMN(TIGMN):
@@ -234,11 +241,41 @@ class MultiTST_TIGMN(TIGMN):
             self.dropout = nn.Dropout(dropout)
         self.edge_generator = nn.Linear(num_h_feats * 2, 2 * num_classes)
         self.node_generator = nn.Linear(num_h_feats, num_classes)
+        self.num_classes = num_classes
 
     def forward(self, batch):
         g, prop_graph, etypes = batch
         feats = g.ndata["x"]
         h = self.i(prop_graph, feats, etypes)
+        if self.hparams.backbone != 'gat':
+            h = self.dropout(h)
+        g.ndata["feat"] = h
+        g = self.generate_edge_factors(g)
+        g.ndata["out"] = self.node_generator(h)
+        return g
+
+
+class SSTTIGMN(TIGMN):
+    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2,
+                 backbone='ggsnn', num_layers=3):
+        super(TIGMN, self).__init__()
+        self.save_hyperparameters()
+        self.embedding = nn.Embedding(20000, num_h_feats)
+        if num_layers > 1:
+            self.i = MultiLayeredGatedGraphConv(num_h_feats, num_h_feats, n_steps=num_steps, n_layers=num_layers, dropout=dropout)
+        else:
+            self.i = GatedGraphConv(num_h_feats, num_h_feats, n_steps=num_steps, n_etypes=2)
+        if backbone != 'gat':
+            self.dropout = nn.Dropout(dropout)
+        self.edge_generator = nn.Linear(num_h_feats * 2, num_classes * num_classes)
+        self.node_generator = nn.Linear(num_h_feats, num_classes)
+        self.num_classes = num_classes
+
+    def forward(self, batch):
+        g = batch
+        feats = g.ndata["x"] + 1
+        h = self.embedding(feats)
+        h = self.i(g, h)
         if self.hparams.backbone != 'gat':
             h = self.dropout(h)
         g.ndata["feat"] = h

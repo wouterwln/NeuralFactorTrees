@@ -11,8 +11,8 @@ class MultiLayeredGatedGraphConv(GatedGraphConv):
                  in_feats,
                  out_feats,
                  n_steps,
-                 n_etypes,
                  n_layers,
+                 n_etypes=1,
                  bias=True,
                  dropout=0.):
         super(GatedGraphConv, self).__init__()

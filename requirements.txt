@@ -1,0 +1,5 @@
+pytorch-lightning==1.7.3
+dgl==0.9.0
+uproot==4.3.4
+awkward==1.8
+nltk==3.7

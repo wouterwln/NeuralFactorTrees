@@ -9,6 +9,7 @@ from pytorch_lightning.plugins import DDPPlugin
 from pytorch_lightning.callbacks.stochastic_weight_avg import StochasticWeightAveraging
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 import json
+from dgl.data import SSTDataset
 
 
 def train(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
@@ -46,7 +47,7 @@ def train_tigmn(batch_size, training_fraction, epochs, workers, prefetch_factor,
 
 def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                  workers, prefetch_factor, memset=TracksterDataset, test=False, k=0.75, extra_edges=True):
-    dataset = PreProcessedEventDataset(extra_edges, False, k=k)
+    dataset = SSTDataset()
     dataset = Subset(dataset, [i for i in range(math.floor(sampling_fraction * len(dataset)))])
     splits = [math.ceil(i * len(dataset)) for i in
               [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
@@ -54,13 +55,12 @@ def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
         splits[-1] -= 1
     train_data, val_data, test_data = random_split(dataset, splits, generator=torch.Generator().manual_seed(seed))
     test_loader = DataLoader(test_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
-                             persistent_workers=False, collate_fn=PreProcessedEventDataset.collate_fn)
+                             persistent_workers=False, collate_fn=dgl.batch)
     if not test:
         train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=workers,
-                                  prefetch_factor=prefetch_factor, persistent_workers=False,
-                                  collate_fn=PreProcessedEventDataset.collate_fn, shuffle=True)
+                                  prefetch_factor=prefetch_factor, persistent_workers=False, collate_fn=dgl.batch)
         val_loader = DataLoader(val_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
-                                persistent_workers=False, collate_fn=PreProcessedEventDataset.collate_fn)
+                                persistent_workers=False, collate_fn=dgl.batch)
         return train_loader, val_loader, test_loader
     else:
         return test_loader
@@ -69,7 +69,7 @@ def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
 def get_trainer(epochs, gpus, tag):
     logger = TensorBoardLogger(save_dir="tb_logs", name=tag)
     checkpoint_callback = ModelCheckpoint(monitor="val_loss")
-    progress_bar = TQDMProgressBar(refresh_rate=100)
+    progress_bar = TQDMProgressBar(refresh_rate=2)
     if tag == "gmnn":
         trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger)
         return trainer
@@ -89,7 +89,8 @@ def train_intratrackster_model(batch_size, training_fraction, epochs, workers, p
     train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                                                          workers, prefetch_factor, k=k)
     if not hgt:
-        model = MultiTST_TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate, backbone=backbone, num_layers=num_layers)
+        model = SSTTIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate, backbone=backbone, num_layers=num_layers,
+                               num_classes=5)
     else:
         model = HGTMultiTST_TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate)
     trainer = get_trainer(epochs, gpus, "itt")
