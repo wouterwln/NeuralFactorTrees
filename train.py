@@ -18,7 +18,7 @@ def train(batch_size, training_fraction, epochs, workers, prefetch_factor, sampl
     train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                                             workers, prefetch_factor, extra_edges=fetching, k=1.)
     pl.seed_everything(seed)
-    model = GMNN(num_h_feats=hidden_dim, in_feats=9, epochs=epochs, num_steps=num_gnn_steps, dropout=dropout)
+    model = GMNN(in_feats=300, num_h_feats=hidden_dim, epochs=epochs, num_steps=num_gnn_steps, dropout=dropout)
     trainer = get_trainer(epochs, gpus, "gmnn")
     trainer.fit(model, train_loader, val_loader)
     metrics = trainer.test(model, dataloaders=test_loader, ckpt_path="best")
@@ -47,7 +47,10 @@ def train_tigmn(batch_size, training_fraction, epochs, workers, prefetch_factor,
 
 def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                  workers, prefetch_factor, memset=TracksterDataset, test=False, k=0.75, extra_edges=True):
-    dataset = SSTDataset()
+    dataset = SSTDataset(glove_embed_file="glove.6B.300d.txt")
+    dataset.process()
+    for i in trange(len(dataset)):
+        dataset[i].ndata["x"] = dataset.pretrained_emb[dataset[i].ndata["x"]].float()
     dataset = Subset(dataset, [i for i in range(math.floor(sampling_fraction * len(dataset)))])
     splits = [math.ceil(i * len(dataset)) for i in
               [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
@@ -71,7 +74,7 @@ def get_trainer(epochs, gpus, tag):
     checkpoint_callback = ModelCheckpoint(monitor="val_loss")
     progress_bar = TQDMProgressBar(refresh_rate=2)
     if tag == "gmnn":
-        trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger)
+        trainer = pl.Trainer(gpus=gpus, precision=32, max_epochs=epochs, logger=logger)
         return trainer
     if gpus == 1:
         trainer = pl.Trainer(gpus=1, precision=32, max_epochs=epochs, logger=logger, auto_lr_find=True,

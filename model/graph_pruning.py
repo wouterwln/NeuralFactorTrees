@@ -84,26 +84,23 @@ class TIGMN(pl.LightningModule):
         self.step(batch, "val")
 
     def test_step(self, batch, batch_idx):
-        labels = batch[0].ndata["y"]
+        labels = batch.ndata["y"]
         pgm = self(batch)
         likelihood = self.sum_likelihood(pgm, labels) - self.partition_function(pgm)
         likelihood = likelihood / len(labels)
         loss = -likelihood
-        self.log("test_loss", loss)
-        self.log("test_likelihood", likelihood)
+        self.log("test_loss", loss, batch_size=len(dgl.unbatch(batch)))
+        self.log("test_likelihood", likelihood, batch_size=len(dgl.unbatch(batch)))
         samples = self.sample(pgm, 1010)
         pgm.ndata["sample"] = samples.T
-        batch = batch[0]
         for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
             labels = g.ndata["y"]
-            labels_bool = labels.bool()
-            energies = g.ndata["x"][:, 3]
             samples = trackster.ndata["sample"].T
             samples_strings = [tuple(row) for row in samples.tolist()]
             counter = collections.Counter(samples_strings)
             top_20 = counter.most_common(20)
             for i, entry in enumerate(top_20):
-                self.log(f"top-{i + 1}-mass", entry[1] / 1000)
+                self.log(f"top-{i + 1}-mass", entry[1] / 1000, batch_size=len(dgl.unbatch(batch)))
             label_str = ''.join(str(item) for item in labels.tolist())
             occurrence = 21
             for n in range(min(20, len(top_20))):
@@ -112,48 +109,9 @@ class TIGMN(pl.LightningModule):
                     occurrence = n
                     break
             for n in range(20):
-                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n))
-                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
-                if torch.sum(labels) > 0:
-                    self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
-                    self.log(f"prunable-top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
-            for n in range(20):
-                try:
-                    accuracy = torch.sum(torch.tensor(top_20[n][0], device=labels.device) == labels) / len(labels)
-                    self.log(f"node_wise_accuracy_{n + 1}", accuracy)
-                    self.log(f"node_wise_accuracy_{n + 1}_{len(labels)}", accuracy)
-                    frac_pruned = torch.ceil(20 * torch.mean(labels.float())) / 20
-                    self.log(f"node_wise_accuracy_{n + 1}_fraction_{frac_pruned}", accuracy)
-                except:
-                    continue
-                try:
-                    prediction = torch.tensor(top_20[n][0], device=labels.device)
-                    correctly_retained = torch.logical_and((labels == 0), (prediction == 0))
-                    correctly_pruned = torch.logical_and((labels == 1), (prediction == 1))
-                    energy_correctly_retained = torch.sum(energies[correctly_retained]) / torch.sum(
-                        energies[labels == 0])
-                    self.log(f"energy_correctly_retained_{n}", energy_correctly_retained)
-                    self.log(f"energy_correctly_retained_{n}_{len(labels)}", energy_correctly_retained)
-                    if torch.sum(labels) > 0:
-                        energy_correctly_pruned = torch.sum(energies[correctly_pruned]) / torch.sum(
-                            energies[labels == 1])
-                        self.log(f"energy_correctly_pruned_{n}", energy_correctly_pruned)
-                        self.log(f"energy_correctly_pruned_{n}_{len(labels)}", energy_correctly_pruned)
-                        self.log(f"sum_energy_pruned_retained_{n}", energy_correctly_pruned + energy_correctly_retained)
-                        self.log(f"sum_energy_pruned_retained_{n}_{len(labels)}",
-                                 energy_correctly_pruned + energy_correctly_retained)
-                    if torch.sum(labels) > 0.1 * len(labels):
-                        self.log(f"high_pruning_fr_energy_correctly_retained_{n}", energy_correctly_retained)
-                        self.log(f"high_pruning_fr_energy_correctly_retained_{n}_{len(labels)}",
-                                 energy_correctly_retained)
-                        self.log(f"high_pruning_fr_energy_correctly_pruned_{n}", energy_correctly_pruned)
-                        self.log(f"high_pruning_fr_energy_correctly_pruned_{n}_{len(labels)}", energy_correctly_pruned)
-                        self.log(f"high_pruning_fr_sum_energy_pruned_retained_{n}",
-                                 energy_correctly_pruned + energy_correctly_retained)
-                        self.log(f"high_pruning_fr_sum_energy_pruned_retained_{n}_{len(labels)}",
-                                 energy_correctly_pruned + energy_correctly_retained)
-                except:
-                    continue
+                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n), batch_size=len(dgl.unbatch(batch)))
+                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n), batch_size=len(dgl.unbatch(batch)))
+
 
     def generate_edge_factors(self, g):
         g.apply_edges(self.concat_message_function)
@@ -181,8 +139,9 @@ class TIGMN(pl.LightningModule):
     def sample(pgm, steps):
         o, t = pgm.edges()
         order = dgl.topological_nodes_generator(pgm)
+        num_classes = int(math.sqrt(pgm.edata["out"].shape[1]))
         pgm = dgl.add_edges(pgm, t, o,
-                            data={"out": torch.transpose(pgm.edata["out"].reshape((-1, 2, 2)), 1, 2).reshape((-1, 4))})
+                            data={"out": torch.transpose(pgm.edata["out"].reshape((-1, num_classes, num_classes)), 1, 2).reshape((-1, num_classes**2))})
         pgm.pull(pgm.nodes(), TIGMN.receive_sample_init_msg, fn.sum('factor', 'fct'))
         pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
         pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
@@ -256,15 +215,14 @@ class MultiTST_TIGMN(TIGMN):
 
 
 class SSTTIGMN(TIGMN):
-    def __init__(self, in_feats=9, num_h_feats=128, dropout=0.1, num_classes=2, lr=0.001, num_steps=2,
+    def __init__(self, in_feats=300, num_h_feats=400, dropout=0.1, num_classes=2, lr=0.001, num_steps=2,
                  backbone='ggsnn', num_layers=3):
         super(TIGMN, self).__init__()
         self.save_hyperparameters()
-        self.embedding = nn.Embedding(20000, num_h_feats)
         if num_layers > 1:
-            self.i = MultiLayeredGatedGraphConv(num_h_feats, num_h_feats, n_steps=num_steps, n_layers=num_layers, dropout=dropout)
+            self.i = MultiLayeredGatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_layers=num_layers, dropout=dropout)
         else:
-            self.i = GatedGraphConv(num_h_feats, num_h_feats, n_steps=num_steps, n_etypes=2)
+            self.i = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2)
         if backbone != 'gat':
             self.dropout = nn.Dropout(dropout)
         self.edge_generator = nn.Linear(num_h_feats * 2, num_classes * num_classes)
@@ -273,9 +231,8 @@ class SSTTIGMN(TIGMN):
 
     def forward(self, batch):
         g = batch
-        feats = g.ndata["x"] + 1
-        h = self.embedding(feats)
-        h = self.i(g, h)
+        feats = g.ndata["x"]
+        h = self.i(g, feats)
         if self.hparams.backbone != 'gat':
             h = self.dropout(h)
         g.ndata["feat"] = h
@@ -318,19 +275,20 @@ class GMNN(pl.LightningModule):
         parser.add_argument("--include_features", action='store_true')
         return parent_parser
 
-    def __init__(self, num_h_feats, in_feats=3, dropout=0.5, num_classes=2, lr=0.001, num_steps=2,
-                 include_features=True, epochs=100):
+    def __init__(self, num_h_feats, in_feats=3, dropout=0.5, num_classes=5, lr=0.001, num_steps=6,
+                 include_features=True, epochs=100, batch_size=32):
         super(GMNN, self).__init__()
         self.save_hyperparameters()
-        self.q = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2)
-        self.p = GatedGraphConv(in_feats + 2, num_h_feats, n_steps=num_steps, n_etypes=2)
-        self.qlin = nn.Linear(num_h_feats, 2)
-        self.plin = nn.Linear(num_h_feats, 2)
+        self.q = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=1)
+        self.p = GatedGraphConv(in_feats + num_classes, num_h_feats, n_steps=num_steps, n_etypes=1)
+        self.qlin = nn.Linear(num_h_feats, num_classes)
+        self.plin = nn.Linear(num_h_feats, num_classes)
         if include_features:
             self.aggregation = lambda x, y: torch.cat([x, y], dim=1)
         else:
             self.aggregation = lambda x, y: x
         self.automatic_optimization = False
+        self.batch_size = batch_size
 
     def configure_optimizers(self):
         lr = self.hparams.lr
@@ -348,11 +306,11 @@ class GMNN(pl.LightningModule):
         return out_p
 
     def q_step(self, batch, tag):
-        _, g, etypes = batch
+        g = batch
         opt, _ = self.optimizers()
         features = g.ndata["x"]
         labels = g.ndata["y"]
-        out_q = self.q(g, features, etypes)
+        out_q = self.q(g, features)
         out_q = self.qlin(out_q)
         # weights = self._calculate_weights(labels)
         loss = F.cross_entropy(out_q, labels)
@@ -364,17 +322,17 @@ class GMNN(pl.LightningModule):
         self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"q_{tag}")
 
     def p_step(self, batch, tag):
-        _, g, etypes = batch
+        g = batch
         _, opt = self.optimizers()
         features = g.ndata["x"]
         labels = g.ndata["y"]
-        out_q = self.q(g, features, etypes)
+        out_q = self.q(g, features)
         out_q = self.qlin(out_q)
         # weights = self._calculate_weights(labels)
 
         in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
         in_p = self.aggregation(in_p, features).detach()
-        out_p = self.p(g, in_p, etypes)
+        out_p = self.p(g, in_p)
         out_p = self.plin(out_p)
 
         loss = F.cross_entropy(out_p, labels)
@@ -399,18 +357,21 @@ class GMNN(pl.LightningModule):
             self.p_step(batch, "val")
 
     def test_step(self, batch, batch_idx):
-        _, g, etypes = batch
+        g = batch
         features = g.ndata["x"]
-        out_q = self.q(g, features, etypes)
+        out_q = self.q(g, features)
         out_q = self.qlin(out_q)
         in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
         in_p = self.aggregation(in_p, features).detach()
-        out_p = self.p(g, in_p, etypes)
+        out_p = self.p(g, in_p)
         out_p = self.plin(out_p)
+        q_loss = F.cross_entropy(out_q, batch.ndata["y"])
+        p_loss = F.cross_entropy(out_p, batch.ndata["y"])
+        self.log("test_q_likelihood", -q_loss, batch_size=self.batch_size)
+        self.log("test_p_likelihood", -p_loss, batch_size=self.batch_size)
         samples = torch.zeros((1000, g.number_of_nodes()), dtype=torch.uint8, device=g.device)
         for i in range(1000):
             samples[i] = torch.argmax(F.gumbel_softmax(out_p, hard=True), dim=-1)
-        batch = batch[0]
         batch.ndata["sample"] = samples.T
         for graph in dgl.unbatch(batch):
             labels = graph.ndata["y"]
@@ -419,7 +380,7 @@ class GMNN(pl.LightningModule):
             counter = collections.Counter(samples_strings)
             top_20 = counter.most_common(20)
             for i, entry in enumerate(top_20):
-                self.log(f"top-{i + 1}-mass", entry[1] / 1000)
+                self.log(f"top-{i + 1}-mass", entry[1] / 1000, batch_size=self.batch_size)
             label_str = ''.join(str(item) for item in labels.tolist())
             occurrence = 21
             for n in range(min(20, len(top_20))):
@@ -428,20 +389,13 @@ class GMNN(pl.LightningModule):
                     occurrence = n
                     break
             for n in range(20):
-                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n))
-                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
-                if torch.sum(labels) > 0:
-                    self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
-                    self.log(f"prunable-top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
-            if torch.sum(labels) > 0.05 * len(labels):
-                subgraphs = graph.subgraph(labels.bool())
-                if len(dgl.topological_nodes_generator(subgraphs)) > 2:
-                    for n in range(20):
-                        self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
+                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n), batch_size=self.batch_size)
+                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n), batch_size=self.batch_size)
+
 
     def log_results(self, loss, pred, labels, tag):
         self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
                  sync_dist=True, batch_size=1)
-        self.log("hp_metric", -loss, sync_dist=True, batch_size=1)
-        self.log(f"{tag}_log_likelihood", -loss, sync_dist=True)
-        self.log(f"{tag}_loss", loss, prog_bar=True, sync_dist=True, batch_size=1)
+        self.log("hp_metric", -loss, sync_dist=True, batch_size=self.batch_size)
+        self.log(f"{tag}_log_likelihood", -loss, sync_dist=True, batch_size=self.batch_size)
+        self.log(f"{tag}_loss", loss, prog_bar=True, sync_dist=True, batch_size=self.batch_size)
