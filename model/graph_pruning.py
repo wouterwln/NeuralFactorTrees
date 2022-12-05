@@ -91,7 +91,7 @@ class TIGMN(pl.LightningModule):
         loss = -likelihood
         self.log("test_loss", loss, batch_size=len(dgl.unbatch(batch)))
         self.log("test_likelihood", likelihood, batch_size=len(dgl.unbatch(batch)))
-        samples = self.sample(pgm, 1010)
+        samples = self.sample(pgm, 10100)
         pgm.ndata["sample"] = samples.T
         for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
             labels = g.ndata["y"]
@@ -100,17 +100,8 @@ class TIGMN(pl.LightningModule):
             counter = collections.Counter(samples_strings)
             top_20 = counter.most_common(20)
             for i, entry in enumerate(top_20):
-                self.log(f"top-{i + 1}-mass", entry[1] / 1000, batch_size=len(dgl.unbatch(batch)))
-            label_str = ''.join(str(item) for item in labels.tolist())
-            occurrence = 21
-            for n in range(min(20, len(top_20))):
-                sample_str = ''.join(str(item) for item in top_20[n][0])
-                if sample_str == label_str:
-                    occurrence = n
-                    break
-            for n in range(20):
-                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n), batch_size=len(dgl.unbatch(batch)))
-                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n), batch_size=len(dgl.unbatch(batch)))
+                if i == 0:
+                    self.log("accuracy", torch.mean(torch.Tensor(entry[0]).to(labels.device) == labels, dtype=torch.float64), batch_size=1)
 
 
     def generate_edge_factors(self, g):
@@ -145,15 +136,15 @@ class TIGMN(pl.LightningModule):
         pgm.pull(pgm.nodes(), TIGMN.receive_sample_init_msg, fn.sum('factor', 'fct'))
         pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
         pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
-        samples = torch.zeros((steps - 10, pgm.number_of_nodes()), device=pgm.device, dtype=torch.uint8)
+        samples = torch.zeros((steps - 100, pgm.number_of_nodes()), device=pgm.device, dtype=torch.uint8)
         for i in range(steps):
             for nodes in order:
                 nodes = nodes.to(pgm.device)
                 pgm.pull(nodes, TIGMN.receive_sample_loopy_msg, fn.sum('factor', 'fct'))
                 pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
                 pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
-            if i >= 10:
-                samples[i - 10] = torch.argmax(pgm.ndata["label"], dim=-1)
+            if i >= 100:
+                samples[i - 100] = torch.argmax(pgm.ndata["label"], dim=-1)
         return samples
 
     @staticmethod
@@ -369,8 +360,12 @@ class GMNN(pl.LightningModule):
         p_loss = F.cross_entropy(out_p, batch.ndata["y"])
         self.log("test_q_likelihood", -q_loss, batch_size=self.batch_size)
         self.log("test_p_likelihood", -p_loss, batch_size=self.batch_size)
-        samples = torch.zeros((1000, g.number_of_nodes()), dtype=torch.uint8, device=g.device)
-        for i in range(1000):
+        pred_q = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        pred_p = F.gumbel_softmax(out_p, hard=True, dim=-1)
+        self.log("q_accuracy", torch.mean(torch.argmax(pred_q, dim=-1) == batch.ndata["y"], dtype=torch.float64), batch_size=self.batch_size)
+        self.log("p_accuracy", torch.mean(torch.argmax(pred_p, dim=-1) == batch.ndata["y"], dtype=torch.float64), batch_size=self.batch_size)
+        samples = torch.zeros((10000, g.number_of_nodes()), dtype=torch.uint8, device=g.device)
+        for i in range(10000):
             samples[i] = torch.argmax(F.gumbel_softmax(out_p, hard=True), dim=-1)
         batch.ndata["sample"] = samples.T
         for graph in dgl.unbatch(batch):
@@ -380,18 +375,9 @@ class GMNN(pl.LightningModule):
             counter = collections.Counter(samples_strings)
             top_20 = counter.most_common(20)
             for i, entry in enumerate(top_20):
-                self.log(f"top-{i + 1}-mass", entry[1] / 1000, batch_size=self.batch_size)
-            label_str = ''.join(str(item) for item in labels.tolist())
-            occurrence = 21
-            for n in range(min(20, len(top_20))):
-                sample_str = ''.join(str(item) for item in top_20[n][0])
-                if sample_str == label_str:
-                    occurrence = n
-                    break
-            for n in range(20):
-                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n), batch_size=self.batch_size)
-                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n), batch_size=self.batch_size)
-
+                if i == 0:
+                    self.log("accuracy", torch.mean(torch.Tensor(entry[0]).to(labels.device) == labels, dtype=torch.float64), batch_size=1)
+                pass
 
     def log_results(self, loss, pred, labels, tag):
         self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
