@@ -10,6 +10,10 @@ from pytorch_lightning.callbacks.stochastic_weight_avg import StochasticWeightAv
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 import json
 from dgl.data import SSTDataset
+import networkx as nx
+import matplotlib.pyplot as plt
+import pydot
+from networkx.drawing.nx_pydot import graphviz_layout
 
 
 def train(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
@@ -53,7 +57,6 @@ def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
         dataset[i].ndata["words"] = dataset[i].ndata["x"]
         dataset[i].ndata["x"] = dataset.pretrained_emb[dataset[i].ndata["x"]].float()
         dataset[i].ndata["x"][dataset[i].ndata["words"] == -1] = torch.zeros(300)
-    dataset = Subset(dataset, [i for i in range(math.floor(sampling_fraction * len(dataset)))])
     splits = [math.ceil(i * len(dataset)) for i in
               [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
     while sum(splits) > len(dataset):

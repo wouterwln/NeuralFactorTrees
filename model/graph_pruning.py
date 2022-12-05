@@ -99,10 +99,11 @@ class TIGMN(pl.LightningModule):
             samples_strings = [tuple(row) for row in samples.tolist()]
             counter = collections.Counter(samples_strings)
             top_20 = counter.most_common(20)
-            for i, entry in enumerate(top_20):
-                if i == 0:
-                    self.log("accuracy", torch.mean(torch.Tensor(entry[0]).to(labels.device) == labels, dtype=torch.float64), batch_size=1)
-
+            self.log("accuracy", torch.mean(torch.Tensor(top_20[0][0]).to(labels.device) == labels, dtype=torch.float64), batch_size=1)
+            counter_thousand_samples = collections.Counter(samples_strings[:1000])
+            top_20_thousand_samples = counter_thousand_samples.most_common(1)
+            overeenkomst = torch.Tensor(top_20_thousand_samples[0][0]) == torch.Tensor(top_20[0][0])
+            self.log("sample_agreement", torch.mean(overeenkomst, dtype=torch.float64), batch_size=1)
 
     def generate_edge_factors(self, g):
         g.apply_edges(self.concat_message_function)
@@ -374,10 +375,12 @@ class GMNN(pl.LightningModule):
             samples_strings = [tuple(row) for row in samples.tolist()]
             counter = collections.Counter(samples_strings)
             top_20 = counter.most_common(20)
-            for i, entry in enumerate(top_20):
-                if i == 0:
-                    self.log("accuracy", torch.mean(torch.Tensor(entry[0]).to(labels.device) == labels, dtype=torch.float64), batch_size=1)
-                pass
+            self.log("accuracy", torch.mean(torch.Tensor(top_20[0][0]).to(labels.device) == labels, dtype=torch.float64), batch_size=1)
+            counter_thousand_samples = collections.Counter(samples_strings[:1000])
+            top_20_thousand_samples = counter_thousand_samples.most_common(1)
+            overeenkomst = torch.Tensor(top_20_thousand_samples[0][0]) == torch.Tensor(top_20[0][0])
+            self.log("sample_agreement", torch.mean(overeenkomst, dtype=torch.float64), batch_size=1)
+
 
     def log_results(self, loss, pred, labels, tag):
         self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
