@@ -104,8 +104,8 @@ class TIGMN(pl.LightningModule):
             counter_thousand_samples = collections.Counter(samples_strings[:n_steps // 100])
             top_20_thousand_samples = counter_thousand_samples.most_common(1)
             for i, entry in enumerate(top_20):
-                self.log(f"top-{i + 1}-mass", entry[1] / (n_steps // 10))
-                self.log(f"top-{i + 1}-mass-thousand", counter_thousand_samples[entry[1]] / (n_steps // 100))
+                self.log(f"top-{i + 1}-mass", entry[1] / (n_steps // 10), batch_size=1)
+                self.log(f"top-{i + 1}-mass-thousand", counter_thousand_samples[entry[1]] / (n_steps // 100), batch_size=1)
             overeenkomst = torch.Tensor(top_20_thousand_samples[0][0]) == torch.Tensor(top_20[0][0])
             self.log("sample_agreement", torch.mean(overeenkomst, dtype=torch.float64), batch_size=1)
 
@@ -141,7 +141,7 @@ class TIGMN(pl.LightningModule):
         pgm.pull(pgm.nodes(), TIGMN.receive_sample_init_msg, fn.sum('factor', 'fct'))
         pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
         pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
-        samples = torch.zeros(((steps // 10) - 100, pgm.number_of_nodes()), device=pgm.device, dtype=torch.uint8)
+        samples = torch.zeros(((steps // 10) - 10, pgm.number_of_nodes()), device=pgm.device, dtype=torch.uint8)
         for i in range(steps):
             for nodes in order:
                 nodes = nodes.to(pgm.device)
@@ -149,7 +149,7 @@ class TIGMN(pl.LightningModule):
                 pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
                 pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
             if i >= 100 and i % 10 == 0:
-                samples[(i // 10) - 100] = torch.argmax(pgm.ndata["label"], dim=-1)
+                samples[(i // 10) - 10] = torch.argmax(pgm.ndata["label"], dim=-1)
         return samples
 
     @staticmethod

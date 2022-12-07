@@ -57,6 +57,7 @@ def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
         dataset[i].ndata["words"] = dataset[i].ndata["x"]
         dataset[i].ndata["x"] = dataset.pretrained_emb[dataset[i].ndata["x"]].float()
         dataset[i].ndata["x"][dataset[i].ndata["words"] == -1] = torch.zeros(300)
+    dataset = Subset(dataset, [i for i in range(math.floor(sampling_fraction * len(dataset)))])
     splits = [math.ceil(i * len(dataset)) for i in
               [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
     while sum(splits) > len(dataset):
