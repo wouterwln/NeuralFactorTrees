@@ -92,7 +92,7 @@ class TIGMN(pl.LightningModule):
         self.log("test_loss", loss, batch_size=len(dgl.unbatch(batch)))
         self.log("test_likelihood", likelihood, batch_size=len(dgl.unbatch(batch)))
         n_steps = 100
-        samples = self.sample(pgm, n_steps + 100)
+        samples = self.sample(pgm, n_steps + 100, 100, 10)
         pgm.ndata["sample"] = samples.T
         for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
             labels = g.ndata["y"]
@@ -105,7 +105,7 @@ class TIGMN(pl.LightningModule):
             top_20_thousand_samples = counter_thousand_samples.most_common(1)
             for i, entry in enumerate(top_20):
                 self.log(f"top-{i + 1}-mass", entry[1] / (n_steps // 10), batch_size=1)
-                self.log(f"top-{i + 1}-mass-thousand", counter_thousand_samples[entry[1]] / (n_steps // 100), batch_size=1)
+                self.log(f"top-{i + 1}-mass-thousand", counter_thousand_samples[entry[0]] / (n_steps // 100), batch_size=1)
             overeenkomst = torch.Tensor(top_20_thousand_samples[0][0]) == torch.Tensor(top_20[0][0])
             self.log("sample_agreement", torch.mean(overeenkomst, dtype=torch.float64), batch_size=1)
 
@@ -132,7 +132,7 @@ class TIGMN(pl.LightningModule):
         return torch.sum(pgm.ndata["c"]) + torch.sum(pgm.edata["c"])
 
     @staticmethod
-    def sample(pgm, steps):
+    def sample(pgm, steps, initial_rejection, rejection_rate):
         o, t = pgm.edges()
         order = dgl.topological_nodes_generator(pgm)
         num_classes = int(math.sqrt(pgm.edata["out"].shape[1]))
@@ -141,15 +141,15 @@ class TIGMN(pl.LightningModule):
         pgm.pull(pgm.nodes(), TIGMN.receive_sample_init_msg, fn.sum('factor', 'fct'))
         pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
         pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
-        samples = torch.zeros(((steps // 10) - 10, pgm.number_of_nodes()), device=pgm.device, dtype=torch.uint8)
+        samples = torch.zeros(((steps // rejection_rate) - (initial_rejection // rejection_rate), pgm.number_of_nodes()), device=pgm.device, dtype=torch.uint8)
         for i in range(steps):
             for nodes in order:
                 nodes = nodes.to(pgm.device)
                 pgm.pull(nodes, TIGMN.receive_sample_loopy_msg, fn.sum('factor', 'fct'))
                 pgm.apply_nodes(lambda x: {'factor': x.data['out'] + x.data['fct']}, pgm.nodes())
                 pgm.apply_nodes(lambda x: {"label": F.gumbel_softmax(x.data["factor"], dim=-1, hard=True)})
-            if i >= 100 and i % 10 == 0:
-                samples[(i // 10) - 10] = torch.argmax(pgm.ndata["label"], dim=-1)
+            if i >= initial_rejection and i % rejection_rate == 0:
+                samples[(i // rejection_rate) - (initial_rejection // rejection_rate)] = torch.argmax(pgm.ndata["label"], dim=-1)
         return samples
 
     @staticmethod
