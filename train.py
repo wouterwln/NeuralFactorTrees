@@ -19,9 +19,8 @@ from networkx.drawing.nx_pydot import graphviz_layout
 def train(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
           num_gnn_steps,
           learning_rate, gpus, dropout, fetching=False):
-    train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
-                                            workers, prefetch_factor, extra_edges=fetching, k=1.)
     pl.seed_everything(seed)
+    train_loader, val_loader, test_loader = prepare_sst_data(batch_size, workers, prefetch_factor)
     model = GMNN(in_feats=300, num_h_feats=hidden_dim, epochs=epochs, num_steps=num_gnn_steps, dropout=dropout)
     trainer = get_trainer(epochs, gpus, "gmnn")
     trainer.fit(model, train_loader, val_loader)
@@ -35,7 +34,7 @@ def train(batch_size, training_fraction, epochs, workers, prefetch_factor, sampl
 def train_tigmn(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
                 num_gnn_steps, learning_rate, gpus, dropout, backbone, num_layers):
     pl.seed_everything(seed)
-    train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
+    train_loader, val_loader, test_loader = prepare_sst_data(sampling_fraction, training_fraction, seed, batch_size,
                                                          workers, prefetch_factor, extra_edges=False)
     model = TIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate, backbone=backbone, num_layers=num_layers)
     trainer = get_trainer(epochs, gpus, "tigmn")
@@ -48,6 +47,28 @@ def train_tigmn(batch_size, training_fraction, epochs, workers, prefetch_factor,
     return model
 
 
+def prepare_sst_data(batch_size, workers, prefetch_factor, test=False):
+    train_data = SSTDataset(glove_embed_file="glove.6B.300d.txt")
+    val_data = SSTDataset(glove_embed_file="glove.6B.300d.txt", mode='dev')
+    test_data = SSTDataset(glove_embed_file="glove.6B.300d.txt", mode='test')
+    train_data.process()
+    val_data.process()
+    test_data.process()
+    for dataset in [train_data, val_data, test_data]:
+        for i in trange(len(dataset)):
+            dataset[i].ndata["words"] = dataset[i].ndata["x"]
+            dataset[i].ndata["x"] = train_data.pretrained_emb[dataset[i].ndata["x"]].float()
+            dataset[i].ndata["x"][dataset[i].ndata["words"] == -1] = torch.zeros(300)
+    test_loader = DataLoader(test_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
+                             persistent_workers=False, collate_fn=dgl.batch)
+    if not test:
+        train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=workers,
+                                  prefetch_factor=prefetch_factor, persistent_workers=False, collate_fn=dgl.batch)
+        val_loader = DataLoader(val_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
+                                persistent_workers=False, collate_fn=dgl.batch)
+        return train_loader, val_loader, test_loader
+    else:
+        return test_loader
 
 def prepare_data(sampling_fraction, training_fraction, seed, batch_size,
                  workers, prefetch_factor, memset=TracksterDataset, test=False, k=0.75, extra_edges=True):
@@ -95,8 +116,7 @@ def get_trainer(epochs, gpus, tag):
 def train_intratrackster_model(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
                 num_gnn_steps, learning_rate, gpus, dropout, backbone, k, num_layers, hgt):
     pl.seed_everything(seed)
-    train_loader, val_loader, test_loader = prepare_data(sampling_fraction, training_fraction, seed, batch_size,
-                                                         workers, prefetch_factor, k=k)
+    train_loader, val_loader, test_loader = prepare_sst_data(batch_size, workers, prefetch_factor)
     if not hgt:
         model = SSTTIGMN(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate, backbone=backbone, num_layers=num_layers,
                                num_classes=5)
