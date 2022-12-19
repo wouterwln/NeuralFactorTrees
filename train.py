@@ -16,11 +16,13 @@ import pydot
 from networkx.drawing.nx_pydot import graphviz_layout
 
 
-def train_gmnn(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
-               num_gnn_steps, gpus, dropout, fetching=False):
+def train_gmnn_cern(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
+               num_gnn_steps, gpus, k=10):
     pl.seed_everything(seed)
-    train_loader, val_loader, test_loader = prepare_sst_data(batch_size, workers, prefetch_factor)
-    model = GMNN(in_feats=300, num_h_feats=hidden_dim, epochs=epochs, num_steps=num_gnn_steps, dropout=dropout)
+    train_loader, val_loader, test_loader = prepare_cern_data(sampling_fraction, training_fraction, seed, batch_size,
+                                                              workers, prefetch_factor, test=False, k=k,
+                                                              extra_edges=True)
+    model = GMNN(num_h_feats=hidden_dim, in_feats=9, epochs=epochs, num_steps=num_gnn_steps, batch_size=batch_size)
     trainer = get_trainer(epochs, gpus, "gmnn")
     trainer.fit(model, train_loader, val_loader)
     metrics = trainer.test(model, dataloaders=test_loader, ckpt_path="best")
@@ -29,6 +31,19 @@ def train_gmnn(batch_size, training_fraction, epochs, workers, prefetch_factor, 
             json.dump(m, f)
     return model
 
+
+def train_gmnn_sst(batch_size, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
+                   num_gnn_steps, gpus):
+    pl.seed_everything(seed)
+    train_loader, val_loader, test_loader = prepare_sst_data(batch_size, workers, prefetch_factor)
+    model = SST_GMNN(in_feats=300, num_h_feats=hidden_dim, epochs=epochs, num_steps=num_gnn_steps, num_classes=5, n_etypes=1, batch_size=batch_size)
+    trainer = get_trainer(epochs, gpus, "gmnn")
+    trainer.fit(model, train_loader, val_loader)
+    metrics = trainer.test(model, dataloaders=test_loader, ckpt_path="best")
+    for i, m in enumerate(metrics):
+        with open(f'gmnn-{sampling_fraction}-{hidden_dim}-{num_gnn_steps}-{epochs}-{i}.json', 'w') as f:
+            json.dump(m, f)
+    return model
 
 def prepare_sst_data(batch_size, workers, prefetch_factor, test=False):
     train_data = SSTDataset(glove_embed_file="glove.6B.300d.txt")

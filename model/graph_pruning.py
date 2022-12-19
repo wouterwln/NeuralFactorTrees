@@ -294,7 +294,7 @@ class SST_NeuralMarkovTree(NeuralMarkovTree):
         loss = -likelihood
         self.log("test_loss", loss, batch_size=len(dgl.unbatch(batch)))
         self.log("test_likelihood", likelihood, batch_size=len(dgl.unbatch(batch)))
-        n_steps = 100
+        n_steps = 5000
         samples = self.sample(pgm, n_steps + 100, 100, 10)
         pgm.ndata["sample"] = samples.T
         for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
@@ -335,12 +335,12 @@ class GMNN(pl.LightningModule):
         parser.add_argument("--include_features", action='store_true')
         return parent_parser
 
-    def __init__(self, num_h_feats, in_feats=3, dropout=0.5, num_classes=5, lr=0.001, num_steps=6,
-                 include_features=True, epochs=100, batch_size=32):
+    def __init__(self, num_h_feats, in_feats=3, num_classes=2, lr=0.001, num_steps=2,
+                 include_features=True, epochs=100, n_etypes=2, batch_size=32):
         super(GMNN, self).__init__()
         self.save_hyperparameters()
-        self.q = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=1)
-        self.p = GatedGraphConv(in_feats + num_classes, num_h_feats, n_steps=num_steps, n_etypes=1)
+        self.q = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=n_etypes)
+        self.p = GatedGraphConv(in_feats + num_classes, num_h_feats, n_steps=num_steps, n_etypes=n_etypes)
         self.qlin = nn.Linear(num_h_feats, num_classes)
         self.plin = nn.Linear(num_h_feats, num_classes)
         if include_features:
@@ -366,12 +366,13 @@ class GMNN(pl.LightningModule):
         return out_p
 
     def q_step(self, batch, tag):
-        g = batch
+        _, g, etypes = batch
         opt, _ = self.optimizers()
         features = g.ndata["x"]
         labels = g.ndata["y"]
-        out_q = self.q(g, features)
+        out_q = self.q(g, features.float(), etypes)
         out_q = self.qlin(out_q)
+        # weights = self._calculate_weights(labels)
         loss = F.cross_entropy(out_q, labels)
         if tag == "train":
             opt.zero_grad()
@@ -381,17 +382,17 @@ class GMNN(pl.LightningModule):
         self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"q_{tag}")
 
     def p_step(self, batch, tag):
-        g = batch
+        _, g, etypes = batch
         _, opt = self.optimizers()
-        features = g.ndata["x"]
+        features = g.ndata["x"].float()
         labels = g.ndata["y"]
-        out_q = self.q(g, features)
+        out_q = self.q(g, features, etypes)
         out_q = self.qlin(out_q)
         # weights = self._calculate_weights(labels)
 
         in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
         in_p = self.aggregation(in_p, features).detach()
-        out_p = self.p(g, in_p)
+        out_p = self.p(g, in_p, etypes)
         out_p = self.plin(out_p)
 
         loss = F.cross_entropy(out_p, labels)
@@ -415,6 +416,104 @@ class GMNN(pl.LightningModule):
             self.p_step(batch, "val")
 
     def test_step(self, batch, batch_idx):
+        _, g, etypes = batch
+        features = g.ndata["x"].float()
+        out_q = self.q(g, features, etypes)
+        out_q = self.qlin(out_q)
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        in_p = self.aggregation(in_p, features).detach()
+        out_p = self.p(g, in_p, etypes)
+        out_p = self.plin(out_p)
+        q_loss = F.cross_entropy(out_q, g.ndata["y"])
+        p_loss = F.cross_entropy(out_p, g.ndata["y"])
+        self.log("test_q_likelihood", -q_loss, batch_size=self.batch_size)
+        self.log("test_p_likelihood", -p_loss, batch_size=self.batch_size)
+        pred_q = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        pred_p = F.gumbel_softmax(out_p, hard=True, dim=-1)
+        self.log("q_accuracy", torch.mean(torch.argmax(pred_q, dim=-1) == g.ndata["y"], dtype=torch.float64),
+                 batch_size=self.batch_size)
+        self.log("p_accuracy", torch.mean(torch.argmax(pred_p, dim=-1) == g.ndata["y"], dtype=torch.float64),
+                 batch_size=self.batch_size)
+        samples = torch.zeros((1000, g.number_of_nodes()), dtype=torch.uint8, device=g.device)
+        for i in range(1000):
+            samples[i] = torch.argmax(F.gumbel_softmax(out_p, hard=True), dim=-1)
+        batch = batch[0]
+        batch.ndata["sample"] = samples.T
+        for graph in dgl.unbatch(batch):
+            labels = graph.ndata["y"]
+            samples = graph.ndata["sample"].T
+            samples_strings = [tuple(row) for row in samples.tolist()]
+            counter = collections.Counter(samples_strings)
+            top_20 = counter.most_common(20)
+            for i, entry in enumerate(top_20):
+                self.log(f"top-{i + 1}-mass", entry[1] / 1000)
+            label_str = ''.join(str(item) for item in labels.tolist())
+            occurrence = 21
+            for n in range(min(20, len(top_20))):
+                sample_str = ''.join(str(item) for item in top_20[n][0])
+                if sample_str == label_str:
+                    occurrence = n
+                    break
+            for n in range(20):
+                self.log(f"top-{n + 1}-accuracy", int(occurrence <= n))
+                self.log(f"top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
+                if torch.sum(labels) > 0:
+                    self.log(f"prunable-top-{n + 1}-accuracy", int(occurrence <= n))
+                    self.log(f"prunable-top-{n + 1}-{len(labels)}-accuracy", int(occurrence <= n))
+            if torch.sum(labels) > 0.05 * len(labels):
+                subgraphs = graph.subgraph(labels.bool())
+                if len(dgl.topological_nodes_generator(subgraphs)) > 2:
+                    for n in range(20):
+                        self.log(f"clustered-top-{n + 1}-accuracy", int(occurrence <= n))
+
+    def log_results(self, loss, pred, labels, tag):
+        self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
+                 sync_dist=True, batch_size=1)
+        self.log("hp_metric", -loss, sync_dist=True, batch_size=self.batch_size)
+        self.log(f"{tag}_log_likelihood", -loss, sync_dist=True, batch_size=self.batch_size)
+        self.log(f"{tag}_loss", loss, prog_bar=True, sync_dist=True, batch_size=self.batch_size)
+
+
+class SST_GMNN(GMNN):
+
+    def q_step(self, batch, tag):
+        g = batch
+        opt, _ = self.optimizers()
+        features = g.ndata["x"]
+        labels = g.ndata["y"]
+        out_q = self.q(g, features)
+        out_q = self.qlin(out_q)
+        loss = F.cross_entropy(out_q, labels)
+        if tag == "train":
+            opt.zero_grad()
+            self.manual_backward(loss)
+            opt.step()
+        pred = torch.argmax(F.softmax(out_q, dim=-1), dim=-1).detach()
+        self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"q_{tag}")
+
+    def p_step(self, batch, tag):
+        g = batch
+        _, opt = self.optimizers()
+        features = g.ndata["x"]
+        labels = g.ndata["y"]
+        out_q = self.q(g, features)
+        out_q = self.qlin(out_q)
+
+        in_p = F.gumbel_softmax(out_q, hard=True, dim=-1)
+        in_p = self.aggregation(in_p, features).detach()
+        out_p = self.p(g, in_p)
+        out_p = self.plin(out_p)
+
+        loss = F.cross_entropy(out_p, labels)
+        if tag == "train":
+            opt.zero_grad()
+            self.manual_backward(loss)
+            opt.step()
+        pred = torch.argmax(F.softmax(out_p, dim=-1), dim=-1).detach()
+        self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"p_{tag}")
+
+
+    def test_step(self, batch, batch_idx):
         g = batch
         features = g.ndata["x"]
         out_q = self.q(g, features)
@@ -433,10 +532,3 @@ class GMNN(pl.LightningModule):
                  batch_size=self.batch_size)
         self.log("p_accuracy", torch.mean(torch.argmax(pred_p, dim=-1) == batch.ndata["y"], dtype=torch.float64),
                  batch_size=self.batch_size)
-
-    def log_results(self, loss, pred, labels, tag):
-        self.log(f"{tag}_accuracy", (labels == pred).float().mean(), prog_bar=False, on_epoch=True, on_step=False,
-                 sync_dist=True, batch_size=1)
-        self.log("hp_metric", -loss, sync_dist=True, batch_size=self.batch_size)
-        self.log(f"{tag}_log_likelihood", -loss, sync_dist=True, batch_size=self.batch_size)
-        self.log(f"{tag}_loss", loss, prog_bar=True, sync_dist=True, batch_size=self.batch_size)

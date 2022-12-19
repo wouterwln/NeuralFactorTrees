@@ -10,9 +10,10 @@ from tqdm import tqdm
 import os
 import shutil
 
+
 class TracksterDataset(Dataset):
 
-    def __init__(self, filename, trackster_root_name, edge_root_name, step_size = 100):
+    def __init__(self, filename, trackster_root_name, edge_root_name, step_size=100):
         read_file = uproot.open(filename)
         self.trackster_root = read_file[trackster_root_name]
         self.edge_root = read_file[edge_root_name]
@@ -43,7 +44,7 @@ class TracksterDataset(Dataset):
         else:
             seed = 0
         node_features[:, :3] = node_features[:, :3] - node_features[seed, :3]
-        node_features[:, 4] = F.relu(node_features[:,4])
+        node_features[:, 4] = F.relu(node_features[:, 4])
         o, t = [ids.index(i) for i in edges.origin], [ids.index(i) for i in edges.target]
         g = dgl.graph((t, o), num_nodes=num_nodes)
         g.ndata["x"] = node_features
@@ -54,28 +55,32 @@ class TracksterDataset(Dataset):
     def collate_fn(data):
         return dgl.batch(data)
 
+
 class preprocessingEvent(Dataset):
     def __init__(self, filename, event_root):
         file = uproot.open(filename)
         self.events_root = file[event_root]
 
     def __getitem__(self, item):
-        arr = self.events_root.arrays(entry_start=item+ 20582, entry_stop=item+20583)[0]
+        arr = self.events_root.arrays(entry_start=item + 20582, entry_stop=item + 20583)[0]
         return EventDataset.preprocess_event(arr)
 
     def __len__(self):
         return len(self.events_root["event"].array()) - 20582
 
+
 class EventDataset(Dataset):
     def __init__(self, filename, event_root, num_samples=0):
         file = uproot.open(filename)
         self.events_root = file[event_root]
-        #if num_samples > 0:
+        # if num_samples > 0:
         #    self.events = self.events_root.arrays(entry_stop = num_samples)
         self.arrays = []
         self.length = num_samples
-        to_select = ['id', 'pos_x', 'pos_y', 'pos_z', 'energy', 'time', 'eta', 'phi', 'layer', 'isSeedCLUE3DHigh', 'isSeedCLUE3DLow', 'simTst_idx', 'recoTst_idx', 'ts_edgestart', 'ts_edgeend']
-        for arrays in tqdm(self.events_root.iterate(to_select, step_size=10, entry_stop=num_samples), total=(num_samples // 10)):
+        to_select = ['id', 'pos_x', 'pos_y', 'pos_z', 'energy', 'time', 'eta', 'phi', 'layer', 'isSeedCLUE3DHigh',
+                     'isSeedCLUE3DLow', 'simTst_idx', 'recoTst_idx', 'ts_edgestart', 'ts_edgeend']
+        for arrays in tqdm(self.events_root.iterate(to_select, step_size=10, entry_stop=num_samples),
+                           total=(num_samples // 10)):
             self.arrays.append(arrays)
 
     def __getitem__(self, item):
@@ -106,7 +111,8 @@ class EventDataset(Dataset):
             del counter[-1]
             most_common = counter.most_common(1)[0][0]
             labels = torch.tensor([most_common not in lc for lc in event.simTst_idx[layer_clusters]], dtype=torch.int64)
-            o, t = [ids.index(i) for i in event.ts_edgestart[trackster]], [ids.index(i) for i in event.ts_edgeend[trackster]]
+            o, t = [ids.index(i) for i in event.ts_edgestart[trackster]], [ids.index(i) for i in
+                                                                           event.ts_edgeend[trackster]]
             g = dgl.graph((t, o))
             node_features = torch.zeros((len(layer_clusters), 9))
             intratrackster_graph.add_nodes(len(layer_clusters))
@@ -124,12 +130,13 @@ class EventDataset(Dataset):
             mask = ~(~(event.layer == layer) + ~(event.recoTst_idx[:, 0] != -1))
             relevant_layer_clusters = event.id[mask]
             if len(relevant_layer_clusters) > 10:
-                coordinates = torch.tensor([event.pos_x[relevant_layer_clusters], event.pos_y[relevant_layer_clusters]]).T
+                coordinates = torch.tensor(
+                    [event.pos_x[relevant_layer_clusters], event.pos_y[relevant_layer_clusters]]).T
                 neighbors = torch.cdist(coordinates, coordinates).topk(4, largest=False).indices[:, 1:]
                 for origin, a in enumerate(neighbors):
                     o.extend(global_ids.index(relevant_layer_clusters[origin]) for _ in a)
                     t.extend(global_ids.index(relevant_layer_clusters[target]) for target in a)
-        edges = np.array([o,t])
+        edges = np.array([o, t])
         return graphs, edges
 
     @staticmethod
@@ -139,6 +146,7 @@ class EventDataset(Dataset):
     @staticmethod
     def collate_fn(data):
         return data
+
 
 class PreProcessedEventDataset(Dataset):
     def __init__(self, include_intratrackster_edges=True, use_presaved_edges=True, k=1):
@@ -165,7 +173,6 @@ class PreProcessedEventDataset(Dataset):
                     edges = edges.numpy().astype(np.int16)
         except IndexError:
             return self[item - 1]
-
         return g, edges
 
     def prepare_edges(self, g):
@@ -185,7 +192,7 @@ class PreProcessedEventDataset(Dataset):
                     [g.ndata["x"][:, 0][mask], g.ndata["x"][:, 1][mask]]).T
                 neighbors = relevant_layer_clusters[(torch.cdist(coordinates, coordinates) < self.k).nonzero()]
                 tsts = g.ndata["i"][neighbors]
-                neighbors = neighbors[tsts[:,0] != tsts[:, 1]]
+                neighbors = neighbors[tsts[:, 0] != tsts[:, 1]]
                 e.append(neighbors)
         try:
             edges = torch.cat(e).T
@@ -218,7 +225,7 @@ class PreProcessedEventDataset(Dataset):
         prop_graphs = dgl.batch(prop_graphs)
         etypes = prop_graphs.edata["t"]
         graphs.ndata["y"] = graphs.ndata["y"].type(torch.int64)
-        graphs.ndata["x"] = graphs.ndata["x"].type(torch.float32)
+        graphs.ndata["x"] = graphs.ndata["x"].type(torch.float32).float()
         return graphs, prop_graphs, etypes
 
     @staticmethod
