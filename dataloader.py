@@ -142,7 +142,7 @@ class EventDataset(Dataset):
 
 class PreProcessedEventDataset(Dataset):
     def __init__(self, include_intratrackster_edges=True, use_presaved_edges=True, k=1):
-        self.root_dir = "event_graph_dataset"
+        self.root_dir = "../../event_graph_dataset"
         self.datapoints = os.listdir(self.root_dir)
         self.length = len(self.datapoints)
         self.include_intratrackster_edges = include_intratrackster_edges
@@ -156,10 +156,10 @@ class PreProcessedEventDataset(Dataset):
         i = self.datapoints[item]
         edges = torch.tensor([[], []], dtype=torch.int64)
         try:
-            g = dgl.load_graphs(f"event_graph_dataset/{i}/{i}.dgl")[0]
+            g = dgl.load_graphs(f"{self.root_dir}/{i}/{i}.dgl")[0]
             if self.include_intratrackster_edges:
-                if self.k == 10 and os.path.exists(f"event_graph_dataset/{i}/{i}.npy"):
-                    edges = np.load(f"event_graph_dataset/{i}/{i}.npy", allow_pickle=True)
+                if self.k == 10 and os.path.exists(f"{self.root_dir}/{i}/{i}.npy"):
+                    edges = np.load(f"{self.root_dir}/{i}/{i}.npy", allow_pickle=True)
                 else:
                     edges = self.prepare_edges(g)
                     edges = edges.numpy().astype(np.int16)
