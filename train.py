@@ -10,10 +10,6 @@ from pytorch_lightning.callbacks.stochastic_weight_avg import StochasticWeightAv
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 import json
 from dgl.data import SSTDataset
-import networkx as nx
-import matplotlib.pyplot as plt
-import pydot
-from networkx.drawing.nx_pydot import graphviz_layout
 
 
 def train_gmnn_cern(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,

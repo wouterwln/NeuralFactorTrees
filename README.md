@@ -1,12 +1,10 @@
-# Graph Pruning at the CMS HGCAL
-This repository contains code to train and evaluate a graph pruning model on CMS HGCAL event data.
-The data used here is preprocessed event data, where CLUE3D reconstructed trackster data is available.
-From the CLUE3D graphs we infer what trackster was being estimated and construct a graph in the training data.
+# Neural Markov Trees for Graph Node Classification 
+This repository contains code to train and evaluate the graph node classification model described in the "Node Classification in Trees" paper by Nuijten and Menkovski.
+The model can be trained on the SST Dataset as well as a (preprocessed) version of the CMS HGCAL Trackster Pruning dataset. 
 
 ## Features
 - Multi-GPU training
 - Multithread data fetching
-- GRU and LSTM aggregator and node memory
 - Tensorboard logging
 - CLI for hyperparameter tuning
 
@@ -21,7 +19,7 @@ From the CLUE3D graphs we infer what trackster was being estimated and construct
 Please make sure to install pytorch and dgl by hand (pip), since these depend on CUDA versions.
 
 ## Project Overview
-This repository contains code to build and train a topology invariant graph vertex classification module.
+This repository contains code to build and train a Neural Markov Tree .
 By parameterizing a Gibbs Distribution that factorizes over a Markov Network we are able to estimate the joint probability distribution over vertex labels. The project is structured as follows: `train.py` contains 
 the training logic, which invokes `model/graph_pruning.py`, which contains the actual module. Elementary submodules
 are hidden in `model/modules.py` such that `model/graph_pruning.py` only contains the novel graph pruning
