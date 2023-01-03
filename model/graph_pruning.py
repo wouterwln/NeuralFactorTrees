@@ -214,6 +214,33 @@ class NeuralMarkovTree(pl.LightningModule):
         return {"factor": messages}
 
     @staticmethod
+    def send_max_product_message(edges):
+        num_classes = int(math.sqrt(edges.data["out"].shape[1]))
+        messages = edges.data["out"].reshape((-1, num_classes, num_classes)) + edges.src["out"].unsqueeze(1)
+        classifications = torch.argmax(torch.logsumexp(messages, dim=1), dim=-1)
+        messages = messages[range(messages.shape[0]), classifications]
+        return {"factor": messages}
+
+    @staticmethod
+    def reverse_max_product_message(edges):
+        num_classes = int(math.sqrt(edges.data["out"].shape[1]))
+        messages = edges.data["out"].reshape((-1, num_classes, num_classes)).transpose(1, 2)
+        messages = torch.logsumexp(messages, dim=1)
+        return {"factor": messages}
+
+    @staticmethod
+    def max_product_classify(pgm):
+        order = dgl.topological_nodes_generator(pgm)
+        for nodes in order:
+            nodes = nodes.to(pgm.device)
+            pgm.pull(nodes, NeuralMarkovTree.send_max_product_message, fn.sum('factor', 'fct'))
+            pgm.apply_nodes(lambda x: {'out': x.data['out'] + x.data['fct']}, nodes)
+        reverse_pgm = pgm.reverse(copy_edata=True)
+        reverse_pgm.pull(range(reverse_pgm.number_of_nodes()), NeuralMarkovTree.reverse_max_product_message, fn.sum('factor', 'fct'))
+        reverse_pgm.apply_nodes(lambda x: {'out': x.data['out'] + x.data['fct']})
+        return torch.argmax(reverse_pgm.ndata["out"], dim=-1)
+
+    @staticmethod
     def concat_message_function(edges):
         return {'cat_feat': torch.cat([edges.src['feat'], edges.dst['feat']], dim=1)}
 
@@ -268,7 +295,7 @@ class SST_NeuralMarkovTree(NeuralMarkovTree):
             self.i = MultiLayeredGatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_layers=num_layers,
                                                 dropout=dropout)
         else:
-            self.i = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=2)
+            self.i = GatedGraphConv(in_feats, num_h_feats, n_steps=num_steps, n_etypes=1)
         if backbone != 'gat':
             self.dropout = nn.Dropout(dropout)
         self.edge_generator = nn.Linear(num_h_feats * 2, num_classes * num_classes)
@@ -295,6 +322,8 @@ class SST_NeuralMarkovTree(NeuralMarkovTree):
         self.log("test_loss", loss, batch_size=len(dgl.unbatch(batch)))
         self.log("test_likelihood", likelihood, batch_size=len(dgl.unbatch(batch)))
         n_steps = 5000
+        classifications = self.max_product_classify(pgm).to(labels.device)
+        self.log("max-product accuracy", torch.mean(classifications == labels, dtype=torch.float64), batch_size=1)
         samples = self.sample(pgm, n_steps + 100, 100, 10)
         pgm.ndata["sample"] = samples.T
         for g, trackster in zip(dgl.unbatch(batch), dgl.unbatch(pgm)):
@@ -511,7 +540,6 @@ class SST_GMNN(GMNN):
             opt.step()
         pred = torch.argmax(F.softmax(out_p, dim=-1), dim=-1).detach()
         self.log_results(deepcopy(loss.detach()), pred, deepcopy(labels), f"p_{tag}")
-
 
     def test_step(self, batch, batch_idx):
         g = batch
