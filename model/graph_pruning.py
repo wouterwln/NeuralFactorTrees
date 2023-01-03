@@ -217,14 +217,14 @@ class NeuralMarkovTree(pl.LightningModule):
     def send_max_product_message(edges):
         num_classes = int(math.sqrt(edges.data["out"].shape[1]))
         messages = edges.data["out"].reshape((-1, num_classes, num_classes)) + edges.src["out"].unsqueeze(1)
-        classifications = torch.argmax(torch.logsumexp(messages, dim=1), dim=-1)
+        classifications = torch.argmax(torch.logsumexp(messages, dim=-1), dim=-1)
         messages = messages[range(messages.shape[0]), classifications]
         return {"factor": messages}
 
     @staticmethod
     def reverse_max_product_message(edges):
         num_classes = int(math.sqrt(edges.data["out"].shape[1]))
-        messages = edges.data["out"].reshape((-1, num_classes, num_classes)).transpose(1, 2)
+        messages = edges.data["out"].reshape((-1, num_classes, num_classes))
         messages = torch.logsumexp(messages, dim=1)
         return {"factor": messages}
 
