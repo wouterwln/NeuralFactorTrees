@@ -1,4 +1,4 @@
-# Neural Markov Trees for Graph Node Classification 
+# Neural Factor Trees for Graph Node Classification 
 This repository contains code to train and evaluate the graph node classification model described in the "Node Classification in Trees" paper by Nuijten and Menkovski.
 The model can be trained on the SST Dataset as well as a (preprocessed) version of the CMS HGCAL Trackster Pruning dataset. 
 
