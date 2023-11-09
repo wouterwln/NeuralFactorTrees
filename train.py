@@ -12,22 +12,6 @@ import json
 from dgl.data import SSTDataset
 
 
-def train_gmnn_cern(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
-               num_gnn_steps, gpus, k=10):
-    pl.seed_everything(seed)
-    train_loader, val_loader, test_loader = prepare_cern_data(sampling_fraction, training_fraction, seed, batch_size,
-                                                              workers, prefetch_factor, test=False, k=k,
-                                                              extra_edges=True)
-    model = GMNN(num_h_feats=hidden_dim, in_feats=9, epochs=epochs, num_steps=num_gnn_steps, batch_size=batch_size)
-    trainer = get_trainer(epochs, gpus, "gmnn")
-    trainer.fit(model, train_loader, val_loader)
-    metrics = trainer.test(model, dataloaders=test_loader, ckpt_path="best")
-    for i, m in enumerate(metrics):
-        with open(f'gmnn-{sampling_fraction}-{hidden_dim}-{num_gnn_steps}-{epochs}-{i}.json', 'w') as f:
-            json.dump(m, f)
-    return model
-
-
 def train_gmnn_sst(batch_size, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
                    num_gnn_steps, gpus):
     pl.seed_everything(seed)
@@ -64,29 +48,6 @@ def prepare_sst_data(batch_size, workers, prefetch_factor, test=False):
     else:
         return test_loader
 
-
-def prepare_cern_data(sampling_fraction, training_fraction, seed, batch_size,
-                      workers, prefetch_factor, test=False, k=0.75, extra_edges=True):
-    dataset = PreProcessedEventDataset(extra_edges, False, k=k)
-    dataset = Subset(dataset, [i for i in range(math.floor(sampling_fraction * len(dataset)))])
-    splits = [math.ceil(i * len(dataset)) for i in
-              [training_fraction, (1. - training_fraction) / 2., (1. - training_fraction) / 2.]]
-    while sum(splits) > len(dataset):
-        splits[-1] -= 1
-    train_data, val_data, test_data = random_split(dataset, splits, generator=torch.Generator().manual_seed(seed))
-    test_loader = DataLoader(test_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
-                             persistent_workers=False, collate_fn=PreProcessedEventDataset.collate_fn)
-    if not test:
-        train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=workers,
-                                  prefetch_factor=prefetch_factor, persistent_workers=False,
-                                  collate_fn=PreProcessedEventDataset.collate_fn, shuffle=True)
-        val_loader = DataLoader(val_data, batch_size=batch_size, num_workers=workers, prefetch_factor=prefetch_factor,
-                                persistent_workers=False, collate_fn=PreProcessedEventDataset.collate_fn)
-        return train_loader, val_loader, test_loader
-    else:
-        return test_loader
-
-
 def get_trainer(epochs, gpus, tag):
     logger = TensorBoardLogger(save_dir="tb_logs", name=tag)
     checkpoint_callback = ModelCheckpoint(monitor="val_loss")
@@ -103,19 +64,6 @@ def get_trainer(epochs, gpus, tag):
                              max_epochs=epochs, logger=logger, num_sanity_val_steps=0, gradient_clip_val=1.,
                              callbacks=[StochasticWeightAveraging(0.5), checkpoint_callback, progress_bar])
     return trainer
-
-
-def train_nmt_cern(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed,
-                   hidden_dim, num_gnn_steps, learning_rate, gpus, dropout, backbone, k, num_layers):
-    pl.seed_everything(seed)
-    train_loader, val_loader, test_loader = prepare_cern_data(sampling_fraction, training_fraction, seed, batch_size,
-                                                              workers, prefetch_factor, test=False, k=k,
-                                                              extra_edges=True)
-    model = MultiTST_NeuralMarkovTree(num_h_feats=hidden_dim, num_steps=num_gnn_steps, dropout=dropout, lr=learning_rate,
-                             backbone=backbone, num_layers=num_layers, num_classes=2)
-    return train_neural_markov_tree(model, epochs, gpus, train_loader, val_loader, test_loader, backbone,
-                                    sampling_fraction, hidden_dim, num_gnn_steps)
-
 
 def train_nmt_sst(batch_size, epochs, workers, prefetch_factor, sampling_fraction, seed, hidden_dim,
                   num_gnn_steps, learning_rate, gpus, dropout, backbone, num_layers):
@@ -141,9 +89,7 @@ def train_neural_markov_tree(model, epochs, gpus, train_loader, val_loader, test
 def continue_training(batch_size, training_fraction, epochs, workers, prefetch_factor, sampling_fraction, seed, gpus, k,
                       num_layers, ckpt):
     pl.seed_everything(seed)
-    train_loader, val_loader, test_loader = prepare_cern_data(sampling_fraction, training_fraction, seed, batch_size,
-                                                              workers, prefetch_factor, k=k)
-
+    train_loader, val_loader, test_loader = prepare_sst_data(batch_size, workers, prefetch_factor)
     trainer = get_trainer(epochs, gpus, "itt")
     model = MultiTST_NeuralMarkovTree.load_from_checkpoint(ckpt, num_layers=num_layers)
     trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt)
@@ -156,9 +102,7 @@ def continue_training(batch_size, training_fraction, epochs, workers, prefetch_f
 
 def test(batch_size, training_fraction, workers, prefetch_factor, sampling_fraction, seed, gpus, k, num_layers, ckpt):
     pl.seed_everything(seed)
-    train_loader, val_loader, test_loader = prepare_cern_data(sampling_fraction, training_fraction, seed, batch_size,
-                                                              workers, prefetch_factor, k=k)
-
+    train_loader, val_loader, test_loader = prepare_sst_data(batch_size, workers, prefetch_factor)
     trainer = get_trainer(1, gpus, "itt")
     model = MultiTST_NeuralMarkovTree.load_from_checkpoint(ckpt, num_layers=num_layers)
     metrics = trainer.test(model, dataloaders=test_loader)
